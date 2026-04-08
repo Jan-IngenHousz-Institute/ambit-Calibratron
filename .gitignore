@@ -4,6 +4,7 @@
 .vscode/c_cpp_properties.json
 .vscode/launch.json
 .vscode/ipch
+.claude/
 =======
 ### AL ###
 #Template for AL projects for Dynamics 365 Business Central
