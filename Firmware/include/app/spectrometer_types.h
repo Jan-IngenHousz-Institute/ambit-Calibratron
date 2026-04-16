@@ -15,3 +15,4 @@ struct SpectrometerResult {
   uint16_t channels[18];   // indexed 0..channel_count-1; 18 = AS7343 bringup max
   uint16_t sat_mask;       // bit N set => channels[N] is saturated or invalid
 };
+

@@ -177,7 +177,7 @@ static bool HandleJson(const String &json) {
 
 void handleCommandText(const String &cmd) {
   if (cmd == "hello") {
-    Serial.println(F("Hello PAR meter ready"));
+    Serial.println(F("MiniPAR,V1.1"));
     
   } else if (cmd == "battery") {
     Serial.println(
@@ -233,6 +233,41 @@ void handleCommandText(const String &cmd) {
   } else if (cmd == "status") {
     cmd_spectrometer_status();
 
+  } else if (cmd == "par_raw") {
+    float par_raw =0;
+    if (cmd_get_par_raw(&par_raw)) {
+      Serial.println(par_raw);
+    } else {
+      Serial.println(F("error_getting_par_raw"));
+    }
+
+  } else if (cmd == "par") {
+    float par = 0;
+    if (cmd_get_par(&par)) {
+      Serial.println(par);
+    } else {
+      Serial.println(F("error_getting_par"));
+    } 
+  
+  } else if (cmd.startsWith("cal_par_slope")) {
+    // Example command: cal_par_slope,0.5
+    int comma = cmd.indexOf(',');
+    if (comma > 0) {
+      const char *arg = cmd.c_str() + comma + 1;
+      set_calibration_slope(1, &arg);
+    } else {
+      Serial.println(F("error_missing_calibration_args"));
+    }
+
+  } else if (cmd.startsWith("cal_par_intercept")) {
+    // Example command: cal_par_intercept,0.2
+    int comma = cmd.indexOf(',');
+    if (comma > 0) {
+      const char *arg = cmd.c_str() + comma + 1;
+      set_calibration_intercept(1, &arg);
+    } else {
+      Serial.println(F("error_missing_calibration_args"));
+    }
   } else if (cmd == "reboot") {
     cmd_reboot();
 

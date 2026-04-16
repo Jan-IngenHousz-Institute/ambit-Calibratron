@@ -7,6 +7,8 @@
 extern bool spectrometer_available;
 extern SpectrometerModel spectrometer_model;
 
+extern float par_coefficients[18]; // per-channel PAR conversion coefficients, indexed 0..channel_count-1
+
 const char *spectrometerModelName(SpectrometerModel model);
 bool initSpectrometer();
 bool spectrometerPrepareLegacyCommand();
@@ -20,3 +22,12 @@ void cmd_spectrometer_status();
 void cmd_spectrometer_set_atime(int argc, const char *argv[]);
 void cmd_spectrometer_set_astep(int argc, const char *argv[]);
 void cmd_spectrometer_set_gain(int argc, const char *argv[]);
+bool cmd_get_par_raw(float *out_par);
+bool cmd_get_par(float *out_par);
+bool set_calibration_slope(int argc, const char *argv[]);
+bool set_calibration_intercept(int argc, const char *argv[]);
+void loadpref();
+
+
+
+

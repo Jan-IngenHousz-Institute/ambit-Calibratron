@@ -27,9 +27,11 @@ void setup() {
   Serial.begin(115200);
 
   Wire.begin(3, 4);
-
+  
+  loadpref();
   // Spectrometer detection and backend initialization
   initSpectrometer();
+  Serial.println(F("Ready"));
 
   
 

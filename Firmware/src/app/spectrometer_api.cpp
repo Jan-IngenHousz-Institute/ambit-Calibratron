@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <Wire.h>
+#include <Preferences.h>
 
 #include "app/as7341_api.h"
 #include "app/as7343_api.h"
@@ -72,6 +73,40 @@ static const char * const kAs7343ChannelNames[13] = {
   "clear",    // derived from VIS averages
   "nir",      // NIR 855nm
 };
+
+
+//float par_coefficients[18] = {0}; // per-channel PAR conversion coefficients, indexed 0..channel_count-1. 18 = AS7343 bringup max
+// default values for AS7341 from datasheet
+float par_coefficients[18] = {
+  1.0/55.0, 
+  1.0/110.0, 
+  1.0/214.0, 
+  1.0/390.0, 
+  1.0/590.0, 
+  1.0/840.0, 
+  1.0/1350.0, 
+  1.0/1070.0, 
+  0,0,0,0,0,0,0,0,0,0}; // per-channel PAR conversion coefficients, indexed 0..channel_count-1. 18 = AS7343 bringup max
+
+  Preferences preferences; // for storing persistent settings like PAR coefficients
+
+float slope = 0;
+float intercept = 0;
+
+void loadpref() {
+  preferences.begin("par_coeffs", true);
+  
+  // for a future phase: if we want to support per-channel PAR coefficients, we can store them in preferences with keys like "ch0", "ch1", etc. For now, just store slope and intercept for a single linear conversion. 
+  //for (int i = 0; i < 18; i++) {
+  //  char key[6];
+  //  snprintf(key, sizeof(key), "ch%d", i);
+  //  par_coefficients[i] = preferences.getFloat(key, par_coefficients[i], 0.0);
+  //}
+  
+  slope = preferences.getFloat("slope", 1.0f);
+  intercept = preferences.getFloat("intercept", 0.0f);
+  preferences.end();
+}
 
 namespace {
 
@@ -582,4 +617,63 @@ void cmd_spectrometer_set_gain(int argc, const char *argv[]) {
     ok = as7343_setGain(static_cast<uint8_t>(val));
   if (!ok) { Serial.println(F("{\"spectrometer_config\":{\"error\":\"set_failed\"}}")); return; }
   printConfigResponse();
+}
+
+bool cmd_get_par_raw(float *out_par)
+{
+  if (!spectrometerPrepareLegacyCommand()) return false;
+
+  SpectrometerResult result;
+  if (!spectrometerReadInto(&result)) {
+    Serial.println(F("{\"spectrometer\":{\"error\":\"read_failed\"}}"));
+    return false;
+  }
+  float par = 0;
+  for (uint8_t i = 0; i < result.channel_count; i++)  
+  {
+    par += result.channels[i] * par_coefficients[i];
+  }
+  *out_par = par;
+  return true;  
+}
+
+bool cmd_get_par(float *out_par)
+{
+  float par_raw = 0;
+  if (!cmd_get_par_raw(&par_raw)) {
+    return false;
+  }
+  // Apply any additional scaling or calibration to par_raw here if needed.
+  *out_par = par_raw * slope + intercept;
+  return true;
+}
+
+bool set_calibration_slope(int argc, const char *argv[])
+{
+  if (argc < 1 ) {
+    Serial.println(F("{\"calibration\":{\"error\":\"missing_args\"}}"));
+    return false;
+  }
+  slope = atof(argv[0]);
+  //store in preferences for persistence across reboots
+  preferences.begin("par_coeffs", false);
+  preferences.putFloat("slope", slope);
+  preferences.end();
+  Serial.println(slope);
+  return true;
+}
+
+bool set_calibration_intercept(int argc, const char *argv[])
+{
+  if (argc < 1 ) {
+    Serial.println(F("{\"calibration\":{\"error\":\"missing_args\"}}"));
+    return false;
+  }
+  intercept = atof(argv[0]);
+  // store in preferences for persistence across reboots
+  preferences.begin("par_coeffs", false);
+  preferences.putFloat("intercept", intercept);
+  preferences.end();
+  Serial.println(intercept);
+  return true;
 }
