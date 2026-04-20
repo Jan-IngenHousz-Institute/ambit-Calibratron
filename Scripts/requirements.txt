@@ -1,0 +1,3 @@
+ipykernel
+matplotlib
+jii_multispeq @ git+https://github.com/Jan-IngenHousz-Institute/JII-MultispeQ.git@main
