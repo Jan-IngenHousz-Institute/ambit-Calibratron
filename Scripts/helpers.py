@@ -61,20 +61,42 @@ def findDevice(question="hello", answer="", flush=True, timeout=5):
     :return: The port where the device was found, or None if not found
     """
     for port in serial_ports():
-        with serial.Serial(port, baudrate=115200, timeout=timeout) as ser:
-            if flush:
-                ser.reset_input_buffer()
-                time.sleep(0.5)
+        try:
+            with serial.Serial(port, baudrate=115200, timeout=timeout) as ser:
+                # Windows-specific: Set DTR and RTS signals (needed for some devices)
+                ser.dtr = True
+                ser.rts = True
+                
+                if flush:
+                    ser.flush()
+                    ser.reset_input_buffer()
+                    ser.reset_output_buffer()
+                    time.sleep(0.5)
+                
+                # Extra delay on Windows to allow device to respond after signals set
+                if sys.platform.startswith('win'):
+                    time.sleep(0.3)
+                    
+                ser.write(question.encode())
+                time.sleep(0.8)  # Increased timing
+                
+                # Use read_all() instead of readline() to handle responses without newlines
+                msg_bytes = ser.read_all()
+                
+                # Decode with unicode_escape encoding for special characters
+                try:
+                    msg = msg_bytes.decode(encoding='unicode_escape')
+                except:
+                    msg = msg_bytes.decode(errors='replace')
+                    
+                print(f"Received message: {msg.strip()}, port: {port}")
 
-            ser.write(question.encode())
-            time.sleep(0.5)
-
-            msg = ser.readline().decode(encoding='unicode_escape')
-            print(f"Received message: {msg.strip()}")
-
-            if answer in msg:
-                print(f"Found device at: {port}, answer: {msg}")
-                return port
+                if answer in msg:
+                    print(f"Found device at: {port}, answer: {msg}")
+                    return port
+        except (OSError, serial.SerialException) as e:
+            print(f"Error accessing {port}: {e}")
+            continue
 
     print("No matching device found.")
     return None
