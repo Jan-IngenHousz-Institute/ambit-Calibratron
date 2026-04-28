@@ -5,17 +5,20 @@
 #include "app/debug_api.h"
 
 void i2c_scan() {
-  Serial.println("Scanning...");
+  Serial.print(F("{\"i2c_scan\":{\"devices\":["));
+  bool first = true;
   for (uint8_t addr = 1; addr < 127; addr++) {
     Wire.beginTransmission(addr);
-    uint8_t err = Wire.endTransmission();
-    if (err == 0) {
-      Serial.print("Found I2C device at 0x");
-      if (addr < 16) Serial.print("0");
-      Serial.println(addr, HEX);
+    if (Wire.endTransmission() == 0) {
+      if (!first) Serial.print(',');
+      first = false;
+      Serial.print(F("\"0x"));
+      if (addr < 0x10) Serial.print('0');
+      Serial.print(addr, HEX);
+      Serial.print('"');
     }
   }
-  Serial.println("Done.");
+  Serial.print(F("]}}"));
 }
 
 void cmd_reboot() {

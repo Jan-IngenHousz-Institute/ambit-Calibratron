@@ -109,6 +109,7 @@ void loadpref() {
   if(preferences.isKey("name"))
   {
     preferences.getString("name", dev_name, 20);
+    dev_name[sizeof(dev_name) - 1] = '\0';
   } 
   preferences.end();
 }
@@ -388,15 +389,15 @@ bool initSpectrometer() {
 }
 
 void spectrometerPrintNotAvailableError() {
-  Serial.println(F("\"spectrometer\":{\"error\":\"not_available\"}"));
+  Serial.print(F("{\"spectrometer\":{\"error\":\"not_available\"}}"));
 }
 
 void spectrometerPrintUnsupportedDeviceError() {
-  Serial.println(F("\"spectrometer\":{\"error\":\"unsupported_device_at_0x39\"}"));
+  Serial.print(F("{\"spectrometer\":{\"error\":\"unsupported_device_at_0x39\"}}"));
 }
 
 void spectrometerPrintNotYetImplementedError() {
-  Serial.println(F("{\"spectrometer\":{\"error\":\"not_yet_implemented\"}}"));
+  Serial.print(F("{\"spectrometer\":{\"error\":\"not_yet_implemented\"}}"));
 }
 
 bool spectrometerPrepareLegacyCommand() {
@@ -423,13 +424,13 @@ bool spectrometer_read() {
 
   SpectrometerResult result;
   if (!spectrometerReadInto(&result)) {
-    Serial.println(F("{\"spectrometer\":{\"error\":\"read_failed\"}}"));
+    Serial.print(F("{\"spectrometer\":{\"error\":\"read_failed\"}}"));
     return false;
   }
 
   Serial.print(F("{\"spectrometer\":"));
   printChannelsObject(result);
-  Serial.println(F("}"));
+  Serial.print(F("}"));
   return true;
 }
 
@@ -443,13 +444,13 @@ bool spectrometer_set_led_current(uint16_t led_current_ma) {
 
   const uint16_t actual_ma = spectrometerSetLedCurrentSilent(led_current_ma);
   if (actual_ma == kLedSetFailed) {
-    Serial.println(F("{\"spectrometer\":{\"error\":\"led_set_failed\"}}"));
+    Serial.print(F("{\"spectrometer\":{\"error\":\"led_set_failed\"}}"));
     return false;
   }
 
   Serial.print(F("{\"spectrometer\":{\"led_current_ma\":"));
   Serial.print(actual_ma);
-  Serial.println(F("}}"));
+  Serial.print(F("}}"));
   return true;
 }
 
@@ -464,14 +465,14 @@ bool spectrometer_read_flash(uint16_t led_current_ma) {
   // Dark read
   SpectrometerResult dark, lit;
   if (!spectrometerReadInto(&dark)) {
-    Serial.println(F("{\"spectrometer\":{\"error\":\"dark_read_failed\"}}"));
+    Serial.print(F("{\"spectrometer\":{\"error\":\"dark_read_failed\"}}"));
     return false;
   }
 
   // Enable LED and wait for settling
   const uint16_t actual_led_ma = spectrometerSetLedCurrentSilent(led_current_ma);
   if (actual_led_ma == kLedSetFailed) {
-    Serial.println(F("{\"spectrometer\":{\"error\":\"led_set_failed\"}}"));
+    Serial.print(F("{\"spectrometer\":{\"error\":\"led_set_failed\"}}"));
     return false;
   }
 
@@ -483,7 +484,7 @@ bool spectrometer_read_flash(uint16_t led_current_ma) {
   // Lit read
   if (!spectrometerReadInto(&lit)) {
     spectrometerSetLedCurrentSilent(0);
-    Serial.println(F("{\"spectrometer\":{\"error\":\"lit_read_failed\"}}"));
+    Serial.print(F("{\"spectrometer\":{\"error\":\"lit_read_failed\"}}"));
     return false;
   }
 
@@ -507,7 +508,7 @@ bool spectrometer_read_flash(uint16_t led_current_ma) {
   printChannelsObject(lit);
   Serial.print(F(",\"spectrometer_diff\":"));
   printChannelsObject(diff);
-  Serial.println(F("}"));
+  Serial.print(F("}"));
   return true;
 }
 
@@ -534,7 +535,7 @@ void cmd_spectrometer_status() {
     Serial.print(gain);
   }
 
-  Serial.println(F("}}"));
+  Serial.print(F("}}"));
 }
 
 // ---------------------------------------------------------------------------
@@ -556,53 +557,53 @@ static void printConfigResponse() {
   if (spectrometer_model == SpectrometerModel::AS7341) gain = as7341_getGain();
   else if (spectrometer_model == SpectrometerModel::AS7343) gain = as7343_getGain();
   Serial.print(gain);
-  Serial.println(F("}}"));
+  Serial.print(F("}}"));
 }
 
 void cmd_spectrometer_set_atime(int argc, const char *argv[]) {
   if (!spectrometerPrepareLegacyCommand()) return;
   if (argc < 1) {
-    Serial.println(F("{\"spectrometer_config\":{\"error\":\"missing_arg\"}}"));
+    Serial.print(F("{\"spectrometer_config\":{\"error\":\"missing_arg\"}}"));
     return;
   }
   const int val = atoi(argv[0]);
   if (val < 0 || val > 255) {
-    Serial.println(F("{\"spectrometer_config\":{\"error\":\"atime_out_of_range\"}}"));
+    Serial.print(F("{\"spectrometer_config\":{\"error\":\"atime_out_of_range\"}}"));
     return;
   }
   bool ok = false;
   if (spectrometer_model == SpectrometerModel::AS7341)
-    ok = (as7341_setAtIME(static_cast<uint8_t>(val)) == static_cast<uint8_t>(val));
+    ok = as7341_setAtIME(static_cast<uint8_t>(val));
   else if (spectrometer_model == SpectrometerModel::AS7343)
     ok = as7343_setAtIME(static_cast<uint8_t>(val));
-  if (!ok) { Serial.println(F("{\"spectrometer_config\":{\"error\":\"set_failed\"}}")); return; }
+  if (!ok) { Serial.print(F("{\"spectrometer_config\":{\"error\":\"set_failed\"}}")); return; }
   printConfigResponse();
 }
 
 void cmd_spectrometer_set_astep(int argc, const char *argv[]) {
   if (!spectrometerPrepareLegacyCommand()) return;
   if (argc < 1) {
-    Serial.println(F("{\"spectrometer_config\":{\"error\":\"missing_arg\"}}"));
+    Serial.print(F("{\"spectrometer_config\":{\"error\":\"missing_arg\"}}"));
     return;
   }
   const long val = atol(argv[0]);
   if (val < 0 || val > 65534) {
-    Serial.println(F("{\"spectrometer_config\":{\"error\":\"astep_out_of_range\"}}"));
+    Serial.print(F("{\"spectrometer_config\":{\"error\":\"astep_out_of_range\"}}"));
     return;
   }
   bool ok = false;
   if (spectrometer_model == SpectrometerModel::AS7341)
-    ok = (as7341_setAStep(static_cast<uint16_t>(val)) == static_cast<uint16_t>(val));
+    ok = as7341_setAStep(static_cast<uint16_t>(val));
   else if (spectrometer_model == SpectrometerModel::AS7343)
     ok = as7343_setAStep(static_cast<uint16_t>(val));
-  if (!ok) { Serial.println(F("{\"spectrometer_config\":{\"error\":\"set_failed\"}}")); return; }
+  if (!ok) { Serial.print(F("{\"spectrometer_config\":{\"error\":\"set_failed\"}}")); return; }
   printConfigResponse();
 }
 
 void cmd_spectrometer_set_gain(int argc, const char *argv[]) {
   if (!spectrometerPrepareLegacyCommand()) return;
   if (argc < 1) {
-    Serial.println(F("{\"spectrometer_config\":{\"error\":\"missing_arg\"}}"));
+    Serial.print(F("{\"spectrometer_config\":{\"error\":\"missing_arg\"}}"));
     return;
   }
   const int val = atoi(argv[0]);
@@ -612,7 +613,7 @@ void cmd_spectrometer_set_gain(int argc, const char *argv[]) {
   if (val < 0 || val > max_gain) {
     Serial.print(F("{\"spectrometer_config\":{\"error\":\"gain_out_of_range_0_"));
     Serial.print(max_gain);
-    Serial.println(F("\"}}"));
+    Serial.print(F("\"}}"));
     return;
   }
   bool ok = false;
@@ -620,7 +621,7 @@ void cmd_spectrometer_set_gain(int argc, const char *argv[]) {
     ok = as7341_setGain(static_cast<as7341_gain_t>(val));
   else if (spectrometer_model == SpectrometerModel::AS7343)
     ok = as7343_setGain(static_cast<uint8_t>(val));
-  if (!ok) { Serial.println(F("{\"spectrometer_config\":{\"error\":\"set_failed\"}}")); return; }
+  if (!ok) { Serial.print(F("{\"spectrometer_config\":{\"error\":\"set_failed\"}}")); return; }
   printConfigResponse();
 }
 
@@ -630,7 +631,7 @@ bool cmd_get_par_raw(float *out_par)
 
   SpectrometerResult result;
   if (!spectrometerReadInto(&result)) {
-    Serial.println(F("{\"spectrometer\":{\"error\":\"read_failed\"}}"));
+    Serial.print(F("{\"spectrometer\":{\"error\":\"read_failed\"}}"));
     return false;
   }
   float par = 0;
@@ -656,7 +657,7 @@ bool cmd_get_par(float *out_par)
 bool set_calibration_slope(int argc, const char *argv[])
 {
   if (argc < 1 ) {
-    Serial.println(F("{\"calibration\":{\"error\":\"missing_args\"}}"));
+    Serial.print(F("{\"calibration\":{\"error\":\"missing_args\"}}"));
     return false;
   }
   slope = atof(argv[0]);
@@ -664,7 +665,9 @@ bool set_calibration_slope(int argc, const char *argv[])
   preferences.begin("par_coeffs", false);
   preferences.putFloat("slope", slope);
   preferences.end();
-  Serial.println(slope);
+  Serial.print(F("{\"calibration\":{\"slope\":"));
+  Serial.print(slope);
+  Serial.print(F("}}"));
   return true;
 }
 
@@ -674,7 +677,7 @@ bool set_calibration_slope(int argc, const char *argv[])
 bool set_calibration_intercept(int argc, const char *argv[])
 {
   if (argc < 1 ) {
-    Serial.println(F("{\"calibration\":{\"error\":\"missing_args\"}}"));
+    Serial.print(F("{\"calibration\":{\"error\":\"missing_args\"}}"));
     return false;
   }
   intercept = atof(argv[0]);
@@ -682,16 +685,20 @@ bool set_calibration_intercept(int argc, const char *argv[])
   preferences.begin("par_coeffs", false);
   preferences.putFloat("intercept", intercept);
   preferences.end();
-  Serial.println(intercept);
+  Serial.print(F("{\"calibration\":{\"intercept\":"));
+  Serial.print(intercept);
+  Serial.print(F("}}"));
   return true;
 }
 
 void cmd_set_dev_name(int argc, const char* name[])
 {
     if (argc < 1 ) {
-      Serial.println(F("{\"calibration\":{\"error\":\"missing_args\"}}"));
+      Serial.print(F("{\"error\":\"missing_args\"}"));
+      return;
     }
-    strncpy(dev_name, name[0], 20);
+    strncpy(dev_name, name[0], sizeof(dev_name) - 1);
+    dev_name[sizeof(dev_name) - 1] = '\0';
     preferences.begin("par_coeffs", false);
     preferences.putString("name", dev_name);
     preferences.end();

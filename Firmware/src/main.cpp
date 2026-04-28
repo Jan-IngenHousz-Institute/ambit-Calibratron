@@ -69,6 +69,7 @@ while (Serial.available() > 0) {
         rx.trim();
         if (rx.length() > 0)
           handleCommandText(rx);
+        Serial.println();
         resetRx();
       }
       continue;
@@ -95,10 +96,9 @@ while (Serial.available() > 0) {
       // Only declare "complete" after the top-level JSON object/array closes.
       if (!inString && braceDepth == 0 && bracketDepth == 0) {
         rx.trim();
-        // bool ok = HandleCommandJson(rx);
-        bool ok = false; // TODO: implement JSON commands and set this accordingly
+        bool ok = handleJsonProtocol(rx);
         if (!ok)
-          Serial.println("json_error");
+          Serial.println(F("{\"error\":\"json_dispatch_failed\"}"));
         resetRx();
       }
       continue;

@@ -75,7 +75,7 @@ bool as7341_readInto(SpectrometerResult *out) {
   return true;
 }
 
-uint8_t as7341_setAtIME(uint8_t atime_value) {
+bool as7341_setAtIME(uint8_t atime_value) {
   return as7341.setATIME(atime_value);
 }
 
@@ -83,7 +83,7 @@ uint8_t as7341_getAtIME() {
   return as7341.getATIME();
 }
 
-uint16_t as7341_setAStep(uint16_t astep_value) {
+bool as7341_setAStep(uint16_t astep_value) {
   return as7341.setASTEP(astep_value);
 }
 

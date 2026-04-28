@@ -3,118 +3,57 @@
 #include "HWCDC.h"
 #include "app/debug_api.h"
 #include "app/spectrometer_api.h"
-#include "app/as7341_api.h"
 
 #include <ArduinoJson.h>
 
 
-// --- Command dispatch system ---
-// find command by name and call it with optional argument(s).
-constexpr size_t CMD_BUF_LEN = 96; // max command text length
-constexpr int MAX_ARGS = 8;        // max args of function
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 
-using CmdFn = bool (*)(int argc, const char *argv[]);
-
-struct CmdEntry {
-  const char *name;
-  CmdFn fn;
-};
-
-static const CmdEntry kCmds[] = {
-    // {"read_spectro", as7341_readAll},
-    // {"set_ATIME", as7341_setAtIME},
-    // {"set_ASTEP", cmd_set_as7341_astep},
-    // {"read_all", cmd_read_all},
-};
-
-static CmdFn findCommand(const char *name) { // find command by name
-  for (auto &e : kCmds) {
-    if (strcmp(e.name, name) == 0)
-      return e.fn;
+static void printJsonSafeString(const char *s) {
+  while (*s) {
+    char c = *s++;
+    if (c == '"' || c == '\\') {
+      Serial.print('\\');
+      Serial.print(c);
+    } else if (c < 0x20) {
+      // skip control characters
+    } else {
+      Serial.print(c);
+    }
   }
-  return nullptr;
 }
 
-
-bool commandExists(const char *cmdText) {
-  // Use to check existence of a command before printing a comma separator
-  if (!cmdText || !*cmdText)
-    return false;
-
-  char buf[CMD_BUF_LEN];
-  strncpy(buf, cmdText, sizeof(buf));
-  buf[sizeof(buf) - 1] = '\0';
-
-  char *saveptr = nullptr;
-  char *name = strtok_r(buf, ",", &saveptr); // take text before first comma
-  if (!name || !*name)
-    return false;
-
-  return findCommand(name) != nullptr;
-}
-
-bool dispatchCommand(const char *cmdText) { // dispatch command string
-  if (!cmdText || !*cmdText)
-    return false;
-
-  char buf[CMD_BUF_LEN];
-  strncpy(buf, cmdText, sizeof(buf));
-  buf[sizeof(buf) - 1] = '\0';
-
-  // Tokenize in-place
-  const char *argv[MAX_ARGS];
-  int argc = 0;
-
-  char *saveptr = nullptr;
-  char *name = strtok_r(buf, ",", &saveptr);
-  if (!name || !*name)
-    return false;
-
-  // remaining tokens become argv[]
-  while (argc < MAX_ARGS) {
-    char *tok = strtok_r(nullptr, ",", &saveptr);
-    if (!tok)
-      break;
-    // Optional: skip empty tokens
-    if (*tok == '\0')
-      continue;
-    argv[argc++] = tok;
-  }
-
-  CmdFn fn = findCommand(name);
-  if (!fn) {
-    Serial.print(F("command not found: "));
-    Serial.println(name);
-    return false;
-  }
-  return fn(argc, argv); // Call the function with args
-}
-
+// ---------------------------------------------------------------------------
+// JSON protocol wrapper
+// ---------------------------------------------------------------------------
 
 static bool serial_string_init() {
-  Serial.print("{\"device_name\":\"PAR meter\",\"device_version\":\"1\",\"device_id\":\"esp32-c3\"");
-  Serial.print("\",\"device_battery\":\"NaN\",\"device_firmware\":1.001,\"sample\":[{\"protocol_id\":\"NaN\",\"set\":[");
+  Serial.print(F("{\"device_name\":\"PAR meter\",\"device_version\":\"1\",\"device_id\":\"esp32-c3\""));
+  Serial.print(F(",\"device_battery\":\"NaN\",\"device_firmware\":1.001,\"sample\":[{\"protocol_id\":\"NaN\",\"set\":["));
   return true;
 }
 
 static bool serial_string_end() {
-  Serial.print("]}]}7A1E3AA1");
-  Serial.print("\n");
+  Serial.print(F("]}]}7A1E3AA1"));
+  Serial.print('\n');
   return true;
 }
 
-static bool HandleJson(const String &json) {
+bool handleJsonProtocol(const String &json) {
   JsonDocument doc;
   DeserializationError err = deserializeJson(doc, json);
 
-  bool handledAny = false;
-  bool firstOut = true; // controls commas
-
   if (err) {
-    Serial.print(F("JSON parse error: "));
-    Serial.println(err.c_str());
+    Serial.print(F("{\"error\":\"json_parse_error\",\"detail\":\""));
+    Serial.print(err.c_str());
+    Serial.println(F("\"}"));
     return false;
   }
+
+  bool handledAny = false;
+  bool firstOut = true;
 
   serial_string_init();
 
@@ -124,7 +63,7 @@ static bool HandleJson(const String &json) {
       if (setObj.isNull())
         continue;
 
-      const char *cmd = setObj["label"]; // OPENJII ASK TO IMPLEMENT CMD rather than label
+      const char *cmd = setObj["label"];
       if (!cmd)
         continue;
 
@@ -133,23 +72,14 @@ static bool HandleJson(const String &json) {
         repeats = 1;
 
       for (uint16_t i = 0; i < repeats; i++) {
-        if (!commandExists(cmd)) {
-          Serial.print(F("command not found: "));
-          Serial.println(cmd);
-          continue;
-        }
-
-        // Print comma BEFORE the next dispatched command
         if (!firstOut)
           Serial.print(',');
         firstOut = false;
 
-        if (dispatchCommand(cmd))
-          handledAny = true;
+        handleCommandText(String(cmd));
+        handledAny = true;
       }
     }
-
-    serial_string_end();
   };
 
   if (doc.is<JsonArray>()) {
@@ -166,9 +96,11 @@ static bool HandleJson(const String &json) {
     if (!proto.isNull())
       processProtocolSet(proto);
   } else {
+    serial_string_end();
     return false;
   }
 
+  serial_string_end();
   return handledAny;
 }
 
@@ -176,13 +108,11 @@ static bool HandleJson(const String &json) {
 
 
 
-void handleCommandText(const String &cmd) {
+bool handleCommandText(const String &cmd) {
   if (cmd == "hello") {
-    Serial.println(F("MiniPAR,V1.1"));
-    
+    Serial.print(F("{\"device\":\"MiniPAR\",\"version\":\"1.1\"}"));
   } else if (cmd == "battery") {
-    Serial.println(
-        F("\"battery\":\"NaN\"")); // Placeholder, implement actual battery reading if available
+    Serial.print(F("{\"battery\":\"NaN\"}"));
 
   } else if (cmd == "i2c_scan") {
     i2c_scan();
@@ -235,20 +165,20 @@ void handleCommandText(const String &cmd) {
     cmd_spectrometer_status();
 
   } else if (cmd == "par_raw") {
-    float par_raw =0;
+    float par_raw = 0;
     if (cmd_get_par_raw(&par_raw)) {
-      Serial.println(par_raw);
-    } else {
-      Serial.println(F("error_getting_par_raw"));
+      Serial.print(F("{\"par_raw\":"));
+      Serial.print(par_raw);
+      Serial.print(F("}"));
     }
 
   } else if (cmd == "par") {
     float par = 0;
     if (cmd_get_par(&par)) {
-      Serial.println(par);
-    } else {
-      Serial.println(F("error_getting_par"));
-    } 
+      Serial.print(F("{\"par\":"));
+      Serial.print(par);
+      Serial.print(F("}"));
+    }
   
   } else if (cmd.startsWith("cal_par_slope")) {
     // Example command: cal_par_slope,0.5
@@ -257,7 +187,7 @@ void handleCommandText(const String &cmd) {
       const char *arg = cmd.c_str() + comma + 1;
       set_calibration_slope(1, &arg);
     } else {
-      Serial.println(F("error_missing_calibration_args"));
+      Serial.print(F("{\"calibration\":{\"error\":\"missing_args\"}}"));
     }
 
   } else if (cmd.startsWith("cal_par_intercept")) {
@@ -267,7 +197,7 @@ void handleCommandText(const String &cmd) {
       const char *arg = cmd.c_str() + comma + 1;
       set_calibration_intercept(1, &arg);
     } else {
-      Serial.println(F("error_missing_calibration_args"));
+      Serial.print(F("{\"calibration\":{\"error\":\"missing_args\"}}"));
     }
 
   } else if (cmd.startsWith("set_name")) {
@@ -276,21 +206,25 @@ void handleCommandText(const String &cmd) {
     if (comma > 0) {
       const char *arg = cmd.c_str() + comma + 1;
       cmd_set_dev_name(1, &arg);
-      Serial.print("new name: " );
-      Serial.println(cmd_get_dev_name());
+      Serial.print(F("{\"device_name\":\""));
+      printJsonSafeString(cmd_get_dev_name());
+      Serial.print(F("\"}"));
 
     } else {
-      Serial.println(F("error_name"));
+      Serial.print(F("{\"error\":\"missing_args\"}"));
     }
   } else if (cmd.startsWith("get_name")) {
-      Serial.println(cmd_get_dev_name());
+    Serial.print(F("{\"device_name\":\""));
+    printJsonSafeString(cmd_get_dev_name());
+    Serial.print(F("\"}"));
   
   
   } else if (cmd == "reboot") {
     cmd_reboot();
 
   } else if (cmd.length() > 0) {
-    Serial.println(F("unknown command"));
-
+    Serial.print(F("{\"error\":\"unknown_command\"}"));
+    return false;
   }
+  return true;
 }
