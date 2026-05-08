@@ -130,20 +130,83 @@ def findDevice(question="hello", answer="", flush=True, timeout=5):
     return None
 
 
+# ============================================================================
+# Protocol Constants & Low-Level Helpers
+# ============================================================================
+
+BAUDRATE = 115200
+
+
+class AmbitProto:
+    """Wire protocol for the Ambit device."""
+    HELLO       = "hello\n"
+    HELLO_ACK   = b"NEW"
+    REBOOT      = "reboot\n"
+    GET_PAR_RAW = "get_par\n"
+    GET_PAR_CAL = "PAR\n"
+    SET_SPEC    = "set_spec, {coeff:.4f}\n"
+    SET_ACT     = "set_act, {coeff:.4f}\n"
+    LED_RUN     = "arrun1,1,1,2,0,0,1,0,1,{led:d},1,\n, \n"
+
+
+class MiniParProto:
+    """Wire protocol for the MiniPAR device."""
+    GET_PAR_RAW = "par_raw\n"
+    GET_PAR_CAL = "par\n"
+    GET_NAME    = "get_name\n"
+
+
+class DCSourceProto:
+    """Wire protocol for the Kiprim DC source."""
+    SET_VOLTAGE = "voltage {v:.3f}\r\n"
+    SET_CURRENT = "current {i:.3f}\r\n"
+    IDN         = "*IDN?\n"
+
+
+def _query(port, cmd, decode="utf-8"):
+    """Open, flush, write, readline. Returns decoded+stripped response."""
+    with serial.Serial(port, baudrate=BAUDRATE) as ser:
+        ser.flush()
+        ser.write(cmd.encode())
+        return ser.readline().decode(encoding=decode).strip()
+
+
+def _command(port, cmd):
+    """Open, flush, write. Fire-and-forget."""
+    with serial.Serial(port, baudrate=BAUDRATE) as ser:
+        ser.flush()
+        ser.write(cmd.encode())
+
+
+def _ambit_query(port, cmd, decode="unicode_escape"):
+    """Open, flush, readiness handshake, write, readline. For Ambit reads."""
+    with serial.Serial(port, baudrate=BAUDRATE) as ser:
+        ser.flush()
+        _wait_for_device_ready(ser)
+        ser.write(cmd.encode())
+        return ser.readline().decode(encoding=decode).strip()
+
+
+def _ambit_command(port, cmd, settle=0.2, verify_ready=True):
+    """Open, flush, readiness handshake, write, settle delay [, re-verify]. For Ambit writes."""
+    with serial.Serial(port, baudrate=BAUDRATE) as ser:
+        ser.flush()
+        _wait_for_device_ready(ser)
+        ser.write(cmd.encode())
+        if settle > 0:
+            time.sleep(settle)
+        if verify_ready:
+            _wait_for_device_ready(ser)
+
+
 def set_voltage(port, voltage):
     """Set voltage on DC source via serial port."""
-    with serial.Serial(port, baudrate=115200) as ser:
-        ser.flush()
-        msg = f"voltage {voltage:.3f}\r\n".encode()
-        ser.write(msg)
+    _command(port, DCSourceProto.SET_VOLTAGE.format(v=voltage))
 
 
 def set_current(port, current):
     """Set current on DC source via serial port."""
-    with serial.Serial(port, baudrate=115200) as ser:
-        ser.flush()
-        msg = f"current {current:.3f}\r\n".encode()
-        ser.write(msg)
+    _command(port, DCSourceProto.SET_CURRENT.format(i=current))
 
 
 # ============================================================================
@@ -158,12 +221,8 @@ def get_par_MP(port, raw=False):
     :param raw: If True, request raw PAR value; if False, request calibrated value
     :return: PAR value as float
     """
-    with serial.Serial(port, baudrate=115200) as ser:
-        ser.flush()
-        cmd = "par_raw\n" if raw else "par\n"
-        ser.write(cmd.encode())
-        r = ser.readline()
-        return float(r.decode().strip())
+    cmd = MiniParProto.GET_PAR_RAW if raw else MiniParProto.GET_PAR_CAL
+    return float(_query(port, cmd))
 
 
 def get_par_AMB(port, raw=False):
@@ -174,20 +233,15 @@ def get_par_AMB(port, raw=False):
     :param raw: If True, request raw PAR value; if False, request calibrated value
     :return: PAR value as float
     """
-    with serial.Serial(port, baudrate=115200) as ser:
-        ser.flush()
-        _wait_for_device_ready(ser)
-        cmd = "get_par\n" if raw else "PAR\n"
-        ser.write(cmd.encode())
-        r = ser.readline().decode(encoding='unicode_escape')
-        return float(r)
+    cmd = AmbitProto.GET_PAR_RAW if raw else AmbitProto.GET_PAR_CAL
+    return float(_ambit_query(port, cmd))
 
 
 # ============================================================================
 # Calibration Functions
 # ============================================================================
 
-def _wait_for_device_ready(ser, expected_response=b"NEW", max_retries=10):
+def _wait_for_device_ready(ser, expected_response=AmbitProto.HELLO_ACK, max_retries=10):
     """
     Wait for device to be ready by polling with 'hello' command.
 
@@ -198,9 +252,8 @@ def _wait_for_device_ready(ser, expected_response=b"NEW", max_retries=10):
     """
     resp = b""
     for _ in range(max_retries):
-        ser.write("hello\n".encode())
+        ser.write(AmbitProto.HELLO.encode())
         resp = ser.readline()
-        # print(f"Response: {resp.decode(encoding='unicode_escape')}")
         if expected_response in resp:
             return resp
         time.sleep(0.1)
@@ -214,15 +267,7 @@ def set_par_gain(port, coeff):
     :param port: Serial port of the Ambit device
     :param coeff: Calibration coefficient value
     """
-    with serial.Serial(port, baudrate=115200) as ser:
-        ser.flush()
-        _wait_for_device_ready(ser)
-
-        msg = f"set_spec, {coeff:.4f}\n".encode()
-        ser.write(msg)
-        time.sleep(0.2)
-
-        _wait_for_device_ready(ser)
+    _ambit_command(port, AmbitProto.SET_SPEC.format(coeff=coeff))
 
 
 def set_ambit_led_gain(port, coeff):
@@ -232,15 +277,7 @@ def set_ambit_led_gain(port, coeff):
     :param port: Serial port of the Ambit device
     :param coeff: Calibration coefficient value
     """
-    with serial.Serial(port, baudrate=115200) as ser:
-        ser.flush()
-        _wait_for_device_ready(ser)
-
-        msg = f"set_act, {coeff:.4f}\n".encode()
-        ser.write(msg)
-        time.sleep(0.2)
-
-        _wait_for_device_ready(ser)
+    _ambit_command(port, AmbitProto.SET_ACT.format(coeff=coeff))
 
 
 
@@ -395,19 +432,18 @@ def ambit_reboot(port):
     """
     info = AmbitInfo()
 
-    with serial.Serial(port, baudrate=115200) as ser:
+    with serial.Serial(port, baudrate=BAUDRATE) as ser:
         ser.flush()
-        ser.write("hello\n".encode())
+        ser.write(AmbitProto.HELLO.encode())
         resp = ser.readline()
-        ser.write("hello\n".encode())
+        ser.write(AmbitProto.HELLO.encode())
         resp = ser.readline()
 
-        while b"NEW" not in resp:
-            ser.write("hello\n".encode())
+        while AmbitProto.HELLO_ACK not in resp:
+            ser.write(AmbitProto.HELLO.encode())
             resp = ser.readline()
-            #print("Response: " + resp.decode(encoding='unicode_escape'))
 
-        ser.write("reboot\n".encode())
+        ser.write(AmbitProto.REBOOT.encode())
 
         # Process ambit data
         for i in range(26):
@@ -419,13 +455,12 @@ def ambit_reboot(port):
                 break
 
     # Verify device is back online
-    with serial.Serial(port, baudrate=115200) as ser:
+    with serial.Serial(port, baudrate=BAUDRATE) as ser:
         ser.flush()
-        ser.write("hello\n".encode())
+        ser.write(AmbitProto.HELLO.encode())
         r = ser.readline()
-        ser.write("hello\n".encode())
+        ser.write(AmbitProto.HELLO.encode())
         r = ser.readline()
-        #print(r)
 
     return info
 
@@ -441,15 +476,11 @@ def set_ambit_led(port, ledCurrent):
     :param port: Serial port of the Ambit device
     :param ledCurrent: LED current value (integer)
     """
-    with serial.Serial(port, baudrate=115200) as ser:
-        ser.flush()
-        _wait_for_device_ready(ser)
-
-        msg = f"arrun1,1,1,2,0,0,1,0,1,{ledCurrent:d},1,\n, \n".encode()
-        ser.write(msg)
-        time.sleep(0.2)
-
-        #_wait_for_device_ready(ser)
+    _ambit_command(
+        port,
+        AmbitProto.LED_RUN.format(led=ledCurrent),
+        verify_ready=False,
+    )
 
 
 # ============================================================================
