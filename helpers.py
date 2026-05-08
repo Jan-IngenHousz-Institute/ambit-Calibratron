@@ -13,13 +13,31 @@ import time
 import logging
 import serial
 import glob
+from dataclasses import dataclass, field
 from matplotlib import pyplot as plt
 import numpy as np
 
 
+class _UnicodeSafeHandler(logging.StreamHandler):
+    """StreamHandler that falls back to ASCII+backslashreplace when the
+    underlying stream's encoding (e.g. Windows cp1252) can't render a char.
+    Without this, a stray byte like 0x80 in serial output crashes the logger.
+    """
+    def emit(self, record):
+        try:
+            msg = self.format(record) + self.terminator
+            try:
+                self.stream.write(msg)
+            except UnicodeEncodeError:
+                self.stream.write(msg.encode("ascii", "backslashreplace").decode("ascii"))
+            self.flush()
+        except Exception:
+            self.handleError(record)
+
+
 logger = logging.getLogger(__name__)
 if not logger.handlers:
-    _h = logging.StreamHandler(sys.stdout)
+    _h = _UnicodeSafeHandler(sys.stdout)
     _h.setFormatter(logging.Formatter("[%(name)s] %(message)s"))
     logger.addHandler(_h)
     logger.setLevel(logging.INFO)
@@ -286,40 +304,40 @@ def set_ambit_led_gain(port, coeff):
 # Device Information & Management
 # ============================================================================
 
+@dataclass
 class AmbitInfo:
     """Container for Ambit device information parsed from a reboot dump."""
 
-    def __init__(self):
-        # Identity / firmware  (existing public fields kept)
-        self.FW = b""               # firmware version, e.g. b"0.0.4"
-        self.IsValid = False
-        self.name = b""             # calibration "Name", e.g. b"AmbitV004"
+    # Identity / firmware
+    FW: bytes = b""                                    # e.g. b"0.0.4"
+    IsValid: bool = False
+    name: bytes = b""                                  # calibration "Name", e.g. b"AmbitV004"
 
-        # New firmware fields
-        self.MAC = ""
-        self.fw_size = 0
-        self.fw_date = ""
+    # Firmware metadata
+    MAC: str = ""
+    fw_size: int = 0
+    fw_date: str = ""
 
-        # Chip detection
-        self.adpd_chip_version = None
+    # Chip detection
+    adpd_chip_version: "int | None" = None
 
-        # Metadata snapshot (GPS + IMU)
-        self.metadata = {}          # {"lon": 0.0, "lat": 0.0, ..., "info1": "8C"}
+    # Metadata snapshot (GPS + IMU)
+    metadata: dict = field(default_factory=dict)       # lon/lat/alt/time/acc/vacc/info1/x/y/z
 
-        # Main calibration line  (existing two fields kept)
-        self.act_led_coeff = 0.0    # Actinic
-        self.light_slope = 0.0      # Spec
-        self.emit_coeff = 0.0
-        self.sun_coeff = 0.0
-        self.temp_offset = 0.0
-        self.temp_slope = 0.0
+    # Main calibration line
+    act_led_coeff: float = 0.0                         # Actinic
+    light_slope: float = 0.0                           # Spec
+    emit_coeff: float = 0.0
+    sun_coeff: float = 0.0
+    temp_offset: float = 0.0
+    temp_slope: float = 0.0
 
-        # Actinic LED curve  {50: 983, 100: 2032, 150: 3121, 200: 4174, 250: 5233}
-        self.actinic_curve = {}
+    # Actinic LED curve {50: 983, 100: 2032, 150: 3121, 200: 4174, 250: 5233}
+    actinic_curve: dict = field(default_factory=dict)
 
-        # ADPD + MLX raw calibration vectors
-        self.adpd_calibration = []
-        self.mlx_calibration = []
+    # ADPD + MLX raw calibration vectors
+    adpd_calibration: list = field(default_factory=list)
+    mlx_calibration: list = field(default_factory=list)
 
     def processInfo(self, line):
         try:
