@@ -78,15 +78,17 @@ static const char * const kAs7343ChannelNames[13] = {
 //float par_coefficients[18] = {0}; // per-channel PAR conversion coefficients, indexed 0..channel_count-1. 18 = AS7343 bringup max
 // default values for AS7341 from datasheet
 float par_coefficients[18] = {
-  1.0/55.0, 
-  1.0/110.0, 
-  1.0/214.0, 
-  1.0/390.0, 
-  1.0/590.0, 
-  1.0/840.0, 
-  1.0/1350.0, 
-  1.0/1070.0, 
-  0,0,0,0,0,0,0,0,0,0}; // per-channel PAR conversion coefficients, indexed 0..channel_count-1. 18 = AS7343 bringup max
+  1.0/55.0, // F1
+  1.0/110.0, // F2
+  1.0/210.0, // F3
+  1.0/390.0, // F4
+  1.0/590.0, // F5
+  1.0/840.0, // F6
+  1.0/1350.0, // F7
+  1.0/1070.0, // F8
+  1.0/1750.0,  // clear
+  1.0/112.0,  // nir
+  0,0,0,0,0,0,0,0}; // per-channel PAR conversion coefficients, indexed 0..channel_count-1. 18 = AS7343 bringup max
 
   Preferences preferences; // for storing persistent settings like PAR coefficients
 
