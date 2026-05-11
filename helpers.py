@@ -10,9 +10,11 @@ This module contains utilities for:
 
 import sys
 import time
+import json
 import logging
 import serial
 import glob
+from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from matplotlib import pyplot as plt
 import numpy as np
@@ -42,6 +44,17 @@ if not logger.handlers:
     logger.addHandler(_h)
     logger.setLevel(logging.INFO)
     logger.propagate = False
+
+
+# ============================================================================
+# Time helpers
+# ============================================================================
+
+def iso_timestamp():
+    """Return the current UTC time as an ISO 8601 / RFC 3339 string with
+    millisecond precision and a trailing 'Z', e.g. ``'2025-09-16T10:45:21.861Z'``.
+    """
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
 # ============================================================================
@@ -398,7 +411,9 @@ class AmbitInfo:
         if text.startswith("FW:"):
             body = text[len("FW:"):].strip()
             if "MAC:" in body:
-                kv = _kv_pairs(body)
+                # Tab-separated; the Date value contains spaces ("Mar  5 2026"),
+                # so split on tabs only rather than on any whitespace.
+                kv = _kv_pairs(body, sep="\t")
                 self.MAC = kv.get("MAC", "")
                 self.fw_size = int(kv["Size"]) if kv.get("Size", "").isdigit() else 0
                 self.fw_date = kv.get("Date", "")
@@ -406,6 +421,33 @@ class AmbitInfo:
                 self.FW = body.encode()
                 self.IsValid = True
             return
+
+    def to_dict(self):
+        """Return all parsed device info as a plain (JSON-friendly) dict.
+
+        Byte fields (``FW``, ``name``) are decoded to ``str`` and the nested
+        ``metadata`` / ``actinic_curve`` dicts and calibration lists are copied
+        so the result can be mutated without touching this instance.
+        """
+        return {
+            "FW": self.FW.decode(errors="replace"),
+            "IsValid": self.IsValid,
+            "name": self.name.decode(errors="replace"),
+            "MAC": self.MAC,
+            "fw_size": self.fw_size,
+            "fw_date": self.fw_date,
+            "adpd_chip_version": self.adpd_chip_version,
+            "act_led_coeff": self.act_led_coeff,
+            "light_slope": self.light_slope,
+            "emit_coeff": self.emit_coeff,
+            "sun_coeff": self.sun_coeff,
+            "temp_offset": self.temp_offset,
+            "temp_slope": self.temp_slope,
+            "actinic_curve": dict(self.actinic_curve),
+            "adpd_calibration": list(self.adpd_calibration),
+            "mlx_calibration": list(self.mlx_calibration),
+            "metadata": dict(self.metadata),
+        }
 
     def __str__(self):
         return (
@@ -422,10 +464,17 @@ class AmbitInfo:
         )
 
 
-def _kv_pairs(text):
-    """Parse 'k:v\\tk:v ...' (any whitespace) into a dict."""
+def _kv_pairs(text, sep=None):
+    """Parse 'k:v<sep>k:v ...' into a dict.
+
+    With the default sep=None, splits on any run of whitespace and also treats
+    commas as separators. Pass sep="\\t" to split on tabs only, which preserves
+    values that contain spaces (e.g. a 'Date:Mar  5 2026' field).
+    """
     out = {}
-    for tok in text.replace(",", " ").split():
+    tokens = text.split(sep) if sep is not None else text.replace(",", " ").split()
+    for tok in tokens:
+        tok = tok.strip()
         if ":" in tok:
             k, v = tok.split(":", 1)
             out[k.strip()] = v.strip()
@@ -481,6 +530,69 @@ def ambit_reboot(port):
         r = ser.readline()
 
     return info
+
+
+def make_calibration_payload(info_precalibration=None, info_postcalibration=None, *,
+                             device_id=None, device_name=None,
+                             firmware_version=None, device_firmware=None,
+                             device_version="1", protocol_id="CALIBRATION",
+                             indent=2):
+    """Build the JSON calibration-upload payload from the pre/post AmbitInfo dumps.
+
+    The ``device_*`` / ``firmware_version`` fields default to values read from
+    ``info_postcalibration`` (falling back to ``info_precalibration``); pass
+    explicit strings to override any of them.
+
+    :param info_precalibration: AmbitInfo captured before calibration
+    :param info_postcalibration: AmbitInfo captured after calibration
+    :param indent: json.dumps indent (None for a compact one-line payload)
+    :return: a JSON string ready to send
+    :raises ValueError: if either AmbitInfo is missing / never populated
+    """
+    empty = [
+        label for label, info in (("info_precalibration", info_precalibration),
+                                  ("info_postcalibration", info_postcalibration))
+        if info is None or not getattr(info, "IsValid", False)
+    ]
+    if empty:
+        logger.warning(
+            "make_calibration_payload aborted: %s %s empty / not populated - "
+            "call ambit_reboot() to fill them before building the payload.",
+            " and ".join(empty), "are" if len(empty) > 1 else "is",
+        )
+        raise ValueError(f"Cannot build calibration payload: {', '.join(empty)} empty / not populated")
+
+    def _pick(attr, default=""):
+        for src in (info_postcalibration, info_precalibration):
+            v = getattr(src, attr, None)
+            if v:
+                return v.decode(errors="replace") if isinstance(v, bytes) else str(v)
+        return default
+
+    mac  = device_id        or _pick("MAC")        or "MACID"
+    name = device_name      or _pick("name")       or "NAME"
+    fw   = firmware_version or _pick("FW")          or "1"
+
+    payload = {
+        "sample": [
+            {
+                "protocol_id": protocol_id,
+                "set": [
+                    {
+                        "METADATA_PRECALIBRATION":  info_precalibration.to_dict(),
+                        "METADATA_POSTCALIBRATION": info_postcalibration.to_dict(),
+                    }
+                ],
+            }
+        ],
+        "device_firmware": device_firmware or fw,
+        "device_id": mac,
+        "device_name": name,
+        "device_version": device_version,
+        "firmware_version": fw,
+        "timestamp": iso_timestamp(),
+    }
+    return json.dumps(payload, indent=indent)
 
 
 # ============================================================================
