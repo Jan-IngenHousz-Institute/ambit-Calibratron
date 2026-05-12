@@ -28,10 +28,10 @@ CALIBRATIONS_DIR = os.path.join(HERE, "calibrations")   # where save_payload() w
 PAR_CAL_CURRENTS = [0.2, 0.4, 0.8, 1.0, 1.6, 0.0]   # A, DC source -> calibration lamp
 LED_CAL_SETTINGS = [10, 20, 60, 90, 150, 0]          # Ambit actinic LED steps
 UPLOAD_GAINS     = True   # set False to preview the fit/plot without writing to the device
-FLASH_FIRMWARE   = True   # set False to skip the uploader.py flashing step in main()
+FORCE_FLASH_FIRMWARE   = False   # set False to skip the uploader.py flashing step in main()
 
 
-def flash_firmware(force_flash=True, run_test=False):
+def flash_firmware(force_flash=False, run_test=False):
     """Run firmware_ambit/uploader.py to (re)flash the Ambit firmware.
 
     The uploader chdir's to its own folder, opens the flasher COM port, and
@@ -78,8 +78,7 @@ def save_payload(payload, mac=None, directory=CALIBRATIONS_DIR):
     return path
 
 
-def calibrate_par_sensor(port_ambit, port_ref, port_dc,
-                         currents=PAR_CAL_CURRENTS, upload=UPLOAD_GAINS):
+def calibrate_par_sensor(port_ambit, port_ref, port_dc, currents=PAR_CAL_CURRENTS, upload=UPLOAD_GAINS):
     """Sweep the calibration lamp, fit Ambit-raw PAR vs MiniPAR reference, show
     the plot, and (optionally) upload the slope as the Ambit PAR gain.
 
@@ -110,8 +109,7 @@ def calibrate_par_sensor(port_ambit, port_ref, port_dc,
     return slope, r2
 
 
-def calibrate_led(port_ambit, port_emit,
-                  settings=LED_CAL_SETTINGS, upload=UPLOAD_GAINS):
+def calibrate_led(port_ambit, port_emit, settings=LED_CAL_SETTINGS, upload=UPLOAD_GAINS):
     """Sweep the Ambit actinic LED, fit measured PAR vs LED setting, show the
     plot, and (optionally) upload the slope as the Ambit LED gain.
 
@@ -130,10 +128,15 @@ def calibrate_led(port_ambit, port_emit,
     slope = float(coeffs[0])
 
     old = helpers.ambit_reboot(port_ambit).act_led_coeff
-    print(f"[LED cal] fit slope={slope:.4f}  R^2={r2:.6f}  (current act_led_coeff={old:.4f})")
-    helpers.plot_data_and_fit(x, y, coeffs, r2,
-                              xlabel="MiniPAR PAR (over LED)", ylabel="Ambit LED setting")
 
+    if r2 < 0.99:
+        print("[LED cal] WARNING: poor fit quality - check the plot for outliers or nonlinearity")
+        helpers.plot_data_and_fit(x, y, coeffs, r2,
+                                xlabel="MiniPAR PAR (over LED)", ylabel="Ambit LED setting")
+        print("[LED cal] uploading old values due to poor fit quality")
+        return old, r2
+
+    print(f"[LED cal] fit slope={slope:.4f}  R^2={r2:.6f}  (current act_led_coeff={old:.4f})")
     if upload:
         helpers.set_ambit_led_gain(port_ambit, slope)
         new = helpers.ambit_reboot(port_ambit).act_led_coeff
@@ -144,13 +147,12 @@ def calibrate_led(port_ambit, port_emit,
 def main():
 
     # 0. Flash the Ambit firmware via firmware_ambit/uploader.py
-    if FLASH_FIRMWARE:
-        print("=== Flashing firmware ===")
-        rc = flash_firmware()
-        if rc != 0:
-            raise SystemExit(f"Firmware flashing failed (uploader.py exit code {rc})")
-        time.sleep(1.0)            # let the device finish rebooting
-        helpers._invalidate_port_cache()   # COM topology may have changed
+    print("=== Flashing firmware ===")
+    rc = flash_firmware(force_flash=FORCE_FLASH_FIRMWARE)
+    if rc != 0:
+        raise SystemExit(f"Firmware flashing failed (uploader.py exit code {rc})")
+    time.sleep(1.0)            # let the device finish rebooting
+    helpers._invalidate_port_cache()   # COM topology may have changed
 
     # 1. Cache check: second serial_ports() call should be ~instant
     t0 = time.perf_counter(); helpers.serial_ports(); t1 = time.perf_counter()
@@ -203,6 +205,14 @@ def main():
     print("\n=== Saving payload ===")
     save_payload(payload, mac=info_postcalibration.MAC)
     # return payload
+
+    # 10. (Optional) Publish the payload to AWS IoT Core via MQTT
+    helpers.publish_payload_mqtt5(
+        payload,
+        topic="experiment/data_ingest/v1/993ae58e-2e87-45ef-96e1-5bbdb0916817/ambit/v1.0/ambit_calibration_1/1234556",
+        certs_dir="ambit_calibration_1_certs/ambit_calibration_1_certs",
+        endpoint="http://a3qrmjf5m5y241-ats.iot.eu-central-1.amazonaws.com",   # your AWS IoT ATS endpoint
+    )
 
 
 if __name__ == "__main__":

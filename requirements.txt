@@ -1,0 +1,20 @@
+# Dependencies for the Calibratron tooling:
+#   - run_Calibratron.py            (+ helpers.py, mqtt_publish.py)
+#   - firmware_ambit/uploader.py
+#   - MiniParCallibration-nonAutomatic.ipynb
+#
+# Install with:
+#   pip install -r requirements.txt
+
+numpy                 # data handling / curve fitting
+matplotlib            # calibration plots
+pyserial              # serial comms with the Ambit / MiniPAR / DC source
+
+paho-mqtt>=2.0        # MQTT v5 publishing (mqtt_publish.py, helpers.publish_payload_mqtt5)
+esptool               # ESP32 firmware flashing (uploader.py); on Windows the bundled
+                      # firmware_ambit/esptool.exe is used instead, so this is optional there
+
+# Needed only to run the .ipynb notebooks from a plain Python install;
+# skip these if you open the notebooks via the VS Code Jupyter extension.
+ipykernel
+notebook

@@ -6,39 +6,61 @@ import sys
 import time
 import argparse
 import re
+import importlib.util
 
 MIN_TEMP = -10
 MAX_TEMP = 40
 MLX_READ_TIME_LIMIT = 100
 
 
+# Firmware images that must sit next to this script (the flasher tool itself is
+# resolved separately by esptool_command(), so it is *not* listed here).
 REQUIRED_FILES = [
     "ambit-1.ino.bin",
     "ambit-1.ino.bootloader.bin",
     "ambit-1.ino.partitions.bin",
     "boot_app0.bin",
-    "esptool.exe",
 ]
 
-ESPTOOL = os.path.join(".", "esptool.exe")
+# WCH CH343 USB-serial bridge on the Ambit flasher.
+TARGET_VID = 0x1A86
+TARGET_PID = 0x55D4
 TARGET_VIDPID = "1A86:55D4"
 
 
-def serial_ports():
-    ports = serial.tools.list_ports.comports()
-    flasher_ports = []
+def esptool_command():
+    """Return the argv prefix used to invoke esptool, cross-platform.
 
-    for port in sorted(ports):
+    Prefers the bundled ``esptool.exe`` on Windows when present; otherwise runs
+    the installed ``esptool`` Python package via ``python -m esptool`` (Linux/
+    macOS, or Windows without the bundled binary).
+
+    :raises RuntimeError: if no esptool is available.
+    """
+    local_exe = os.path.join(os.path.dirname(os.path.abspath(__file__)), "esptool.exe")
+    if os.name == "nt" and os.path.isfile(local_exe):
+        return [local_exe]
+    if importlib.util.find_spec("esptool") is not None:
+        return [sys.executable, "-m", "esptool"]
+    raise RuntimeError(
+        "esptool not found. Install it with `pip install esptool`, "
+        "or place esptool.exe next to this script (Windows only)."
+    )
+
+
+def serial_ports():
+    flasher_ports = []
+    for port in sorted(serial.tools.list_ports.comports()):
         try:
-            hwid = getattr(port, "hwid", "")
-            port_name = getattr(port, "device", None)
+            device = getattr(port, "device", None)
+            if not device:
+                continue
+            hwid = (getattr(port, "hwid", "") or "").upper()
+            matches_vidpid = (getattr(port, "vid", None), getattr(port, "pid", None)) == (TARGET_VID, TARGET_PID)
+            if matches_vidpid or TARGET_VIDPID in hwid:
+                flasher_ports.append(device)
         except Exception:
             continue
-
-        if "USB " in hwid and TARGET_VIDPID in hwid:
-            if port_name:
-                flasher_ports.append(port_name)
-
     return flasher_ports
 
 
@@ -67,7 +89,7 @@ def detect_invalid_header(port, timeout_s=5, baud=115200):
 
 def flash(port):
     cmd = [
-        ESPTOOL,
+        *esptool_command(),
         "--chip",
         "esp32c3",
         "--baud",
@@ -237,6 +259,12 @@ def main(force_flash=True, run_test=False):
     missing = [f for f in REQUIRED_FILES if not os.path.exists(f)]
     if missing:
         print(f"[ERROR] Missing required files: {', '.join(missing)}")
+        return 1
+
+    try:
+        print(f"[INFO] Using esptool: {' '.join(esptool_command())}")
+    except RuntimeError as exc:
+        print(f"[ERROR] {exc}")
         return 1
 
     ports = serial_ports()

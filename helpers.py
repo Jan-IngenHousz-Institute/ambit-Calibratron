@@ -8,6 +8,7 @@ This module contains utilities for:
 - Device calibration
 """
 
+import os
 import sys
 import time
 import json
@@ -177,6 +178,7 @@ class AmbitProto:
     GET_PAR_CAL = "PAR\n"
     SET_SPEC    = "set_spec, {coeff:.4f}\n"
     SET_ACT     = "set_act, {coeff:.4f}\n"
+    SET_NAME    = "set_name,{name}\n"
     LED_RUN     = "arrun1,1,1,2,0,0,1,0,1,{led:d},1,\n, \n"
 
 
@@ -532,6 +534,31 @@ def ambit_reboot(port):
     return info
 
 
+def set_ambit_name(port, name):
+    """
+    Set the Ambit device name.
+
+    Sends ``hello`` twice, waits for the device's acknowledgment, then sends
+    ``set_name,<name>``.
+
+    :param port: Serial port of the Ambit device
+    :param name: New device name (string)
+    """
+    with serial.Serial(port, baudrate=BAUDRATE) as ser:
+        ser.flush()
+        ser.write(AmbitProto.HELLO.encode())
+        resp = ser.readline()
+        ser.write(AmbitProto.HELLO.encode())
+        resp = ser.readline()
+
+        while AmbitProto.HELLO_ACK not in resp:
+            ser.write(AmbitProto.HELLO.encode())
+            resp = ser.readline()
+
+        ser.write(AmbitProto.SET_NAME.format(name=name).encode())
+        time.sleep(0.2)
+
+
 def make_calibration_payload(info_precalibration=None, info_postcalibration=None, *,
                              device_id=None, device_name=None,
                              firmware_version=None, device_firmware=None,
@@ -593,6 +620,125 @@ def make_calibration_payload(info_precalibration=None, info_postcalibration=None
         "timestamp": iso_timestamp(),
     }
     return json.dumps(payload, indent=indent)
+
+
+# ============================================================================
+# MQTT publishing
+# ============================================================================
+# The same code is also available as the standalone `mqtt_publish` module
+# (importable + runnable as a CLI). It's kept here too so `helpers.*` works
+# on its own; `mqtt_publish` is preferred if it's importable.
+
+def _resolve_cert_files(certs_dir):
+    """Locate the AWS-IoT-style credential files inside ``certs_dir`` (searched recursively).
+
+    Ignores macOS ``__MACOSX/`` directories and ``._*`` resource forks, so a
+    folder straight out of a downloaded ``*_certs.zip`` works as-is.
+
+    :return: (ca_file, cert_file, key_file)
+    :raises FileNotFoundError: if any of the three cannot be found
+    """
+    try:
+        from mqtt_publish import resolve_cert_files
+        return resolve_cert_files(certs_dir)
+    except ImportError:
+        pass
+
+    def _find(*patterns):
+        for pat in patterns:
+            hits = [h for h in glob.glob(os.path.join(certs_dir, "**", pat), recursive=True)
+                    if "__MACOSX" not in h and not os.path.basename(h).startswith("._")]
+            if hits:
+                return sorted(hits)[0]
+        raise FileNotFoundError(f"no file matching {patterns} under {certs_dir!r}")
+
+    cert_file = _find("*-certificate.pem.crt", "*certificate*.pem*", "*.pem.crt", "*.crt")
+    key_file  = _find("*-private.pem.key", "*private*.pem*", "*.pem.key", "*.key")
+    ca_file   = _find("AmazonRootCA1.pem", "AmazonRootCA*.pem", "*RootCA*.pem", "*-CA*.pem", "*.pem")
+    return ca_file, cert_file, key_file
+
+
+def publish_payload_mqtt5(payload, topic, certs_dir, endpoint, *,
+                          client_id=None, port=8883, qos=1, timeout=10.0):
+    """Publish ``payload`` to ``topic`` over MQTT 5 with mutual-TLS auth (e.g. AWS IoT Core).
+
+    :param payload: bytes / str sent verbatim; anything else (dict, list, ...) is json-encoded
+    :param topic: MQTT topic to publish to
+    :param certs_dir: folder holding the cert / key / CA files (see :func:`_resolve_cert_files`)
+    :param endpoint: broker host; a ``scheme://host[:port][/path]`` URL is accepted too
+    :param client_id: MQTT client id (default: the cert folder's basename)
+    :param port: TLS port (default 8883; an explicit ``:port`` in ``endpoint`` wins)
+    :param qos: publish QoS, 0 or 1
+    :param timeout: seconds to wait for the connection and for the publish ack
+    :return: True on success
+    :raises ImportError: if paho-mqtt is not installed
+    :raises ConnectionError / TimeoutError: on connect/publish failure
+    """
+    # Prefer the standalone module if it's importable; fall back to a local copy.
+    try:
+        from mqtt_publish import publish_mqtt5
+        return publish_mqtt5(payload, topic, certs_dir, endpoint,
+                             client_id=client_id, port=port, qos=qos, timeout=timeout)
+    except ImportError:
+        pass
+
+    import ssl
+    import threading
+    try:
+        import paho.mqtt.client as mqtt
+        from paho.mqtt.enums import CallbackAPIVersion
+    except ImportError as exc:  # pragma: no cover
+        raise ImportError("publish_payload_mqtt5 needs paho-mqtt >= 2.0: pip install paho-mqtt") from exc
+
+    ca_file, cert_file, key_file = _resolve_cert_files(certs_dir)
+    if client_id is None:
+        client_id = os.path.basename(os.path.normpath(certs_dir)) or "calibratron"
+
+    # Accept a bare host, or a "scheme://host[:port][/path]" URL - reduce to the host.
+    endpoint = endpoint.strip()
+    if "://" in endpoint:
+        endpoint = endpoint.split("://", 1)[1]
+    endpoint = endpoint.split("/", 1)[0]
+    if ":" in endpoint:
+        host, _, maybe_port = endpoint.rpartition(":")
+        if maybe_port.isdigit():
+            endpoint, port = host, int(maybe_port)
+
+    body = payload if isinstance(payload, (bytes, bytearray, str)) else json.dumps(payload)
+
+    connected = threading.Event()
+    conn_state = {}
+
+    def _on_connect(client, userdata, flags, reason_code, properties=None):
+        conn_state["rc"] = reason_code
+        connected.set()
+
+    client = mqtt.Client(callback_api_version=CallbackAPIVersion.VERSION2,
+                         client_id=client_id, protocol=mqtt.MQTTv5)
+    client.on_connect = _on_connect
+    client.tls_set(ca_certs=ca_file, certfile=cert_file, keyfile=key_file,
+                   tls_version=ssl.PROTOCOL_TLS_CLIENT)
+
+    logger.info("MQTT5 connecting to %s:%d as %s ...", endpoint, port, client_id)
+    client.connect(endpoint, port, keepalive=60)
+    client.loop_start()
+    try:
+        if not connected.wait(timeout):
+            raise TimeoutError(f"MQTT connect to {endpoint}:{port} timed out after {timeout}s")
+        rc = conn_state.get("rc")
+        if rc is not None and getattr(rc, "is_failure", False):
+            raise ConnectionError(f"MQTT connect to {endpoint} rejected: {rc}")
+        info = client.publish(topic, body, qos=qos)
+        info.wait_for_publish(timeout)
+        if not info.is_published():
+            raise TimeoutError(f"publish to {topic!r} not acknowledged within {timeout}s")
+    finally:
+        client.loop_stop()
+        client.disconnect()
+
+    n = len(body if isinstance(body, (bytes, bytearray)) else body.encode())
+    logger.info("MQTT5 published %d bytes to topic %r", n, topic)
+    return True
 
 
 # ============================================================================
