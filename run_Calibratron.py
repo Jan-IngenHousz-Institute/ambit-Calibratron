@@ -11,8 +11,53 @@ Whatever isn't connected is reported and that calibration step is skipped, so
 the script is still useful with only the Ambit plugged in.
 """
 
-import os, json, time, importlib, warnings
+import os, sys, json, time, re, importlib, subprocess, warnings
 from datetime import datetime
+
+
+def _ensure_requirements(req_file="requirements.txt"):
+    """Check that the requirements.txt dependencies are installed, and pip-install
+    any that are missing.
+
+    Runs before the heavier third-party imports below, so the script can be
+    launched on a fresh environment without a manual ``pip install`` step.
+    Distributions are matched by name only (version specifiers are ignored for
+    the check); if anything is missing, the whole requirements file is installed.
+
+    :param req_file: requirements file name, resolved next to this script.
+    """
+    import importlib.metadata as md
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    path = os.path.join(here, req_file)
+    if not os.path.exists(path):
+        print(f"[deps] {req_file} not found next to the script - skipping check")
+        return
+
+    installed = {name.lower() for name in md.packages_distributions()}
+    installed |= {d.metadata["Name"].lower() for d in md.distributions()}
+
+    missing = []
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.split("#", 1)[0].strip()          # drop comments
+            if not line:
+                continue
+            name = re.split(r"[<>=!~ \[]", line, 1)[0].strip().lower()
+            if name and name not in installed:
+                missing.append(name)
+
+    if not missing:
+        print("[deps] all requirements.txt dependencies present")
+        return
+
+    print(f"[deps] missing packages: {', '.join(missing)} - installing from {req_file}")
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "-r", path])
+    print("[deps] dependencies installed")
+
+
+_ensure_requirements()   # install missing deps before the third-party imports below
+
 import numpy as np
 import helpers; importlib.reload(helpers)
 
