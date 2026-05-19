@@ -14,6 +14,9 @@ import time
 import json
 import logging
 import serial
+import serial.tools.list_ports
+import subprocess
+import importlib.util
 import glob
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
@@ -187,6 +190,7 @@ class MiniParProto:
     GET_PAR_RAW = "par_raw\n"
     GET_PAR_CAL = "par\n"
     GET_NAME    = "get_name\n"
+    SET_NAME    = "set_name,{name}\n"
 
 
 class DCSourceProto:
@@ -559,6 +563,32 @@ def set_ambit_name(port, name):
         time.sleep(0.2)
 
 
+def set_MP_name(port, name="miniPAR", verbose=False):
+    """
+    Set the device name on a MiniPAR device.
+
+    Sends ``set_name,<name>`` and verifies the device echoes the new name back
+    in the ``device_name`` field of its JSON response.
+
+    :param port: Serial port of the MiniPAR device
+    :param name: New device name (default: "miniPAR")
+    :param verbose: If True, log the raw device response
+    :return: True if the device confirmed the new name, False otherwise
+    """
+    resp = _query(port, MiniParProto.SET_NAME.format(name=name))
+    if verbose:
+        logger.info("Response from device: %s", resp)
+    try:
+        returned_name = json.loads(resp).get("device_name", "")
+    except json.JSONDecodeError:
+        logger.warning("Could not parse MiniPAR response: %s", resp)
+        return False
+    if returned_name != name:
+        logger.warning("Error setting name %r: device returned %r", name, returned_name)
+        return False
+    return True
+
+
 def make_calibration_payload(info_precalibration=None, info_postcalibration=None, *,
                              device_id=None, device_name=None,
                              firmware_version=None, device_firmware=None,
@@ -620,6 +650,212 @@ def make_calibration_payload(info_precalibration=None, info_postcalibration=None
         "timestamp": iso_timestamp(),
     }
     return json.dumps(payload, indent=indent)
+
+
+# ============================================================================
+# Firmware Flashing (Ambit)
+# ============================================================================
+# Self-contained Ambit firmware flasher ported from the standalone
+# ``ambit_uploader.py``: it locates the compiled firmware images, resolves
+# esptool, finds the flasher serial port, and runs the flash - so the
+# calibration tooling can (re)flash an Ambit without shelling out to any
+# external uploader script.
+
+# WCH CH343 USB-serial bridge used by the Ambit flasher.
+FLASHER_VID = 0x1A86
+FLASHER_PID = 0x55D4
+FLASHER_VIDPID = "1A86:55D4"
+
+# Compiled Ambit firmware images; all must live together in one folder.
+AMBIT_FIRMWARE_FILES = [
+    "ambit-1.ino.bin",
+    "ambit-1.ino.bootloader.bin",
+    "ambit-1.ino.partitions.bin",
+    "boot_app0.bin",
+]
+
+# esptool flash offset -> image, for the ESP32-C3 on the Ambit.
+_AMBIT_FLASH_LAYOUT = [
+    ("0x0",     "ambit-1.ino.bootloader.bin"),
+    ("0x8000",  "ambit-1.ino.partitions.bin"),
+    ("0xe000",  "boot_app0.bin"),
+    ("0x10000", "ambit-1.ino.bin"),
+]
+
+
+def find_file(start_dir, filename):
+    """Return the path to the first ``filename`` found in ``start_dir`` or any
+    of its sub-folders, or None if it is nowhere to be found.
+    """
+    for root, _dirs, files in os.walk(start_dir):
+        if filename in files:
+            return os.path.join(root, filename)
+    return None
+
+
+def find_firmware_dir(start_dir, required_files=AMBIT_FIRMWARE_FILES):
+    """Search ``start_dir`` and its sub-folders for a folder that holds every
+    file in ``required_files``.
+
+    :param start_dir: directory tree to search
+    :param required_files: filenames that must all be present together
+    :return: absolute path of the first matching folder, or None
+    """
+    required = set(required_files)
+    for root, _dirs, files in os.walk(start_dir):
+        if required.issubset(files):
+            return os.path.abspath(root)
+    return None
+
+
+def esptool_command(firmware_dir=None):
+    """Return the argv prefix used to invoke esptool, cross-platform.
+
+    Prefers a bundled ``esptool.exe`` on Windows (searched inside
+    ``firmware_dir`` when given); otherwise runs the installed ``esptool``
+    package via ``python -m esptool``.
+
+    :param firmware_dir: optional folder to search for a bundled esptool.exe
+    :raises RuntimeError: if no esptool is available
+    """
+    if os.name == "nt" and firmware_dir:
+        local_exe = find_file(firmware_dir, "esptool.exe")
+        if local_exe:
+            return [local_exe]
+    if importlib.util.find_spec("esptool") is not None:
+        return [sys.executable, "-m", "esptool"]
+    raise RuntimeError(
+        "esptool not found - install it with `pip install esptool`, "
+        "or place esptool.exe next to the firmware images (Windows only)."
+    )
+
+
+def flasher_ports():
+    """List serial ports that look like an Ambit flasher (WCH CH343 bridge).
+
+    :return: list of port device names matching the flasher VID/PID
+    """
+    found = []
+    for port in sorted(serial.tools.list_ports.comports()):
+        try:
+            device = getattr(port, "device", None)
+            if not device:
+                continue
+            hwid = (getattr(port, "hwid", "") or "").upper()
+            vidpid_ok = ((getattr(port, "vid", None), getattr(port, "pid", None))
+                         == (FLASHER_VID, FLASHER_PID))
+            if vidpid_ok or FLASHER_VIDPID in hwid:
+                found.append(device)
+        except Exception:
+            continue
+    return found
+
+
+def detect_invalid_header(port, timeout_s=5, baud=BAUDRATE):
+    """Listen briefly on ``port`` for the boot-time "invalid header" string.
+
+    :param port: serial port to probe
+    :param timeout_s: how long to listen, in seconds
+    :return: (found, serial_output) - ``found`` is True if "invalid header" was seen
+    """
+    serial_output = ""
+    logger.info("Listening on %s for %ss to detect boot status...", port, timeout_s)
+    try:
+        with serial.Serial(port, baud, timeout=0.1) as ser:
+            deadline = time.time() + timeout_s
+            while time.time() < deadline:
+                chunk = ser.read(128)
+                if not chunk:
+                    continue
+                serial_output += chunk.decode(errors="replace")
+                if "invalid header" in serial_output:
+                    return True, serial_output
+    except serial.SerialException as exc:
+        logger.error("Could not open serial port %s: %s", port, exc)
+    return False, serial_output
+
+
+def flash_ambit(port, firmware_dir):
+    """Write the Ambit firmware images in ``firmware_dir`` to the device on
+    ``port`` by invoking esptool.
+
+    :param port: serial port of the Ambit flasher
+    :param firmware_dir: folder holding the AMBIT_FIRMWARE_FILES images
+    :raises RuntimeError: if esptool exits non-zero
+    """
+    cmd = [
+        *esptool_command(firmware_dir),
+        "--chip", "esp32c3",
+        "--baud", "921600",
+        "--port", port,
+        "--before", "default_reset",
+        "--after", "hard_reset",
+        "write_flash", "-z",
+        "--flash_mode", "keep",
+        "--flash_freq", "keep",
+        "--flash_size", "keep",
+    ]
+    for offset, image in _AMBIT_FLASH_LAYOUT:
+        cmd += [offset, image]
+
+    logger.info("Flashing %s with esptool...", port)
+    result = subprocess.run(cmd, cwd=firmware_dir)
+    if result.returncode != 0:
+        raise RuntimeError(f"esptool exited with return code {result.returncode}")
+    logger.info("Flash completed.")
+
+
+def flash_ambit_firmware(firmware_dir=None, *, search_root=None, port=None,
+                         force_flash=True):
+    """Locate the Ambit firmware, find the flasher port, and flash the device.
+
+    Self-contained equivalent of the standalone ``ambit_uploader.py`` script:
+    the calibration tooling can (re)flash an Ambit on its own.
+
+    :param firmware_dir: folder holding the firmware images; if None, it is
+        discovered by searching ``search_root`` (see :func:`find_firmware_dir`)
+    :param search_root: directory tree searched for the firmware when
+        ``firmware_dir`` is None (default: this module's own folder)
+    :param port: flasher serial port; if None, auto-detected (exactly one
+        flasher must be connected)
+    :param force_flash: when True, always flash; when False, flash only if a
+        boot-time "invalid header" is detected on the device
+    :return: True if the device was flashed, False if flashing was skipped
+    :raises FileNotFoundError: if the firmware images cannot be located
+    :raises RuntimeError: if zero / multiple flasher ports are found, or esptool fails
+    """
+    if firmware_dir is None:
+        root = search_root or os.path.dirname(os.path.abspath(__file__))
+        firmware_dir = find_firmware_dir(root, AMBIT_FIRMWARE_FILES)
+        if firmware_dir is None:
+            raise FileNotFoundError(
+                f"Could not find the Ambit firmware files "
+                f"({', '.join(AMBIT_FIRMWARE_FILES)}) under {root!r}"
+            )
+    logger.info("Using firmware folder: %s", firmware_dir)
+
+    if port is None:
+        ports = flasher_ports()
+        if not ports:
+            raise RuntimeError("No Ambit flasher USB device found.")
+        if len(ports) != 1:
+            raise RuntimeError(
+                f"Expected 1 flasher port, found {len(ports)}: {', '.join(ports)}"
+            )
+        port = ports[0]
+    logger.info("Using flasher port: %s", port)
+
+    if not force_flash:
+        needs_flash, serial_log = detect_invalid_header(port)
+        if not needs_flash:
+            if serial_log.strip():
+                logger.info("No 'invalid header' detected; flashing not required.")
+            else:
+                logger.warning("No serial output during probe; skipping flash.")
+            return False
+
+    flash_ambit(port, firmware_dir)
+    return True
 
 
 # ============================================================================

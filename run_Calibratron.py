@@ -11,7 +11,7 @@ Whatever isn't connected is reported and that calibration step is skipped, so
 the script is still useful with only the Ambit plugged in.
 """
 
-import os, sys, json, subprocess, time, importlib
+import os, json, time, importlib, warnings
 from datetime import datetime
 import numpy as np
 import helpers; importlib.reload(helpers)
@@ -22,40 +22,92 @@ import helpers; importlib.reload(helpers)
 # __file__ may be a relative path and the kernel CWD is the workspace root,
 # which would otherwise make os.path.abspath(__file__) point to the wrong dir.
 HERE             = os.path.dirname(os.path.abspath(helpers.__file__))
-UPLOADER         = os.path.join(HERE, "firmware_ambit", "uploader.py")   # firmware flasher
+FIRMWARE_DIR     = os.path.join(HERE, "firmware_ambit")   # Ambit firmware images to flash
 CALIBRATIONS_DIR = os.path.join(HERE, "calibrations")   # where save_payload() writes
 
 PAR_CAL_CURRENTS = [0.2, 0.4, 0.8, 1.0, 1.6, 0.0]   # A, DC source -> calibration lamp
 LED_CAL_SETTINGS = [10, 20, 60, 90, 150, 0]          # Ambit actinic LED steps
 UPLOAD_GAINS     = True   # set False to preview the fit/plot without writing to the device
-FORCE_FLASH_FIRMWARE   = False   # set False to skip the uploader.py flashing step in main()
+FORCE_FLASH_FIRMWARE   = False     # True -> always re-flash, regardless of current version
+AMBIT_FW_VERSION       = "0.0.4"   # expected Ambit firmware; flash only if the device differs
+RENAME_AMBIT = True
 
 
-def flash_firmware(force_flash=False, run_test=False):
-    """Run firmware_ambit/uploader.py to (re)flash the Ambit firmware.
+def _detect_ambit_version():
+    """Discover an Ambit and return its firmware version string.
 
-    The uploader chdir's to its own folder, opens the flasher COM port, and
-    closes it again before returning, so the serial port is free for discovery
-    afterwards.
-
-    :param force_flash: pass --force-flash=true to re-flash even when the
-        current firmware looks valid; otherwise the uploader only flashes when
-        it detects an "invalid header" on boot.
-    :param run_test: pass --run-test=true to run the uploader's post-flash
-        sensor self-test.
-    :return: the uploader's exit code (0 = success)
+    :return: the firmware version (e.g. "0.0.5"), or None if no Ambit responds
+        on any serial port.
     """
-    if not os.path.isfile(UPLOADER):
-        raise FileNotFoundError(f"uploader.py not found at {UPLOADER!r}")
-    cmd = [
-        sys.executable, UPLOADER,
-        f"--force-flash={'true' if force_flash else 'false'}",
-        f"--run-test={'true' if run_test else 'false'}",
-    ]
-    print(f"[flash] {' '.join(cmd)}")
-    rc = subprocess.run(cmd, cwd=os.path.dirname(UPLOADER)).returncode
-    print(f"[flash] uploader.py exited with code {rc}")
-    return rc
+    helpers._invalidate_port_cache()   # COM topology may have changed
+    port = helpers.findDevice(question="hello\n", answer="NEW", flush=True, timeout=4)
+    if port is None:
+        return None
+    fw = helpers.ambit_reboot(port).FW
+    return fw.decode(errors="replace").strip() if fw else None
+
+
+def flash_firmware(force_flash=False, version=None):
+    """(Re)flash the Ambit firmware via helpers.flash_ambit_firmware().
+
+    Uses the firmware images in FIRMWARE_DIR; no external uploader script is
+    involved. helpers.flash_ambit_firmware() locates the flasher COM port,
+    opens it for esptool, and closes it again, so the port is free for
+    discovery afterwards.
+
+    Flashing is decided as follows:
+      - ``force_flash=True`` -> always flash, regardless of the current version.
+      - ``version`` given    -> detect the Ambit's current firmware and flash
+        only when it differs from ``version``, or when no Ambit is detected.
+        After flashing, the device is rebooted and a warning is raised if the
+        running version still isn't ``version``.
+      - neither given        -> flash only when an "invalid header" is detected
+        on boot.
+
+    :param force_flash: re-flash even when the current firmware looks valid;
+        otherwise flashing happens only on a version mismatch / invalid header.
+    :param version: expected firmware version string (e.g. "0.0.5"). When set,
+        the Ambit is flashed only if its current firmware differs from this.
+    :return: 0 on success (including a deliberately skipped flash), 1 on failure.
+    """
+    # Decide whether the Ambit needs flashing, and whether to force it
+    # (a version mismatch flashes even with force_flash=False).
+    should_force = force_flash
+    if force_flash:
+        print("[flash] force_flash=True - flashing regardless of current version")
+    elif version is not None:
+        current = _detect_ambit_version()
+        if current is None:
+            print(f"[flash] no Ambit detected - flashing firmware {version}")
+            should_force = True
+        elif current == version:
+            print(f"[flash] Ambit already runs firmware {current} - skipping flash")
+            return 0
+        else:
+            print(f"[flash] Ambit runs firmware {current!r}, expected {version!r} - flashing")
+            should_force = True
+    else:
+        print("[flash] no target version - flashing only on invalid header")
+
+    try:
+        flashed = helpers.flash_ambit_firmware(firmware_dir=FIRMWARE_DIR,
+                                               force_flash=should_force)
+    except (FileNotFoundError, RuntimeError) as exc:
+        print(f"[flash] flashing failed: {exc}")
+        return 1
+    print(f"[flash] {'firmware flashed' if flashed else 'flash skipped'}")
+
+    # Verify the freshly-flashed firmware matches the expected version.
+    if version is not None and flashed:
+        time.sleep(1.0)   # let the device finish rebooting
+        running = _detect_ambit_version()
+        if running != version:
+            warnings.warn(f"Firmware flashed NOT the one expected "
+                          f"(running {running!r}, expected {version!r})")
+        else:
+            print(f"[flash] verified firmware {running}")
+
+    return 0
 
 
 def save_payload(payload, mac=None, directory=CALIBRATIONS_DIR):
@@ -147,12 +199,14 @@ def calibrate_led(port_ambit, port_emit, settings=LED_CAL_SETTINGS, upload=UPLOA
 def main():
 
     # 0. Flash the Ambit firmware via firmware_ambit/uploader.py
-    print("=== Flashing firmware ===")
-    rc = flash_firmware(force_flash=FORCE_FLASH_FIRMWARE)
-    if rc != 0:
-        raise SystemExit(f"Firmware flashing failed (uploader.py exit code {rc})")
-    time.sleep(1.0)            # let the device finish rebooting
-    helpers._invalidate_port_cache()   # COM topology may have changed
+    if FORCE_FLASH_FIRMWARE:
+        print("WARNING: FORCE_FLASH_FIRMWARE is True - the device will be re-flashed even if it already runs the expected firmware")
+        print("=== Flashing firmware ===")
+        rc = flash_firmware(force_flash=FORCE_FLASH_FIRMWARE, version=AMBIT_FW_VERSION)
+        if rc != 0:
+            raise SystemExit(f"Firmware flashing failed (uploader.py exit code {rc})")
+        time.sleep(1.0)            # let the device finish rebooting
+        helpers._invalidate_port_cache()   # COM topology may have changed
 
     # 1. Cache check: second serial_ports() call should be ~instant
     t0 = time.perf_counter(); helpers.serial_ports(); t1 = time.perf_counter()
@@ -175,7 +229,23 @@ def main():
     port_emit = helpers.findDevice(question="get_name\n", answer="Emit_LED", flush=True, timeout=2)
     port_dc   = helpers.findDevice(question="*IDN?\n",    answer="KIPRIM",   flush=True, timeout=2)
 
-    # 5. PAR-sensor calibration (needs the DC source + PAR-reference MiniPAR)
+    # 5. Flash new version
+    current_fw = info_precalibration.FW.decode(errors="replace").strip()
+    if AMBIT_FW_VERSION and current_fw != AMBIT_FW_VERSION:
+        print(f"\n=== Firmware version mismatch: running {current_fw!r}, expected {AMBIT_FW_VERSION!r} ===")
+        rc = flash_firmware(force_flash=FORCE_FLASH_FIRMWARE, version=AMBIT_FW_VERSION)
+        if rc != 0:
+            raise SystemExit(f"Firmware flashing failed (uploader.py exit code {rc})")
+        time.sleep(1.0)            # let the device finish rebooting
+        helpers._invalidate_port_cache()   # COM topology may have changed
+
+    # 6. Rename ambit
+    if RENAME_AMBIT:
+        current_name = info_precalibration.name.decode(errors="replace").strip()
+        new_name = input(f"Enter new name for Ambit (current: {current_name}): ").strip()
+        helpers.set_ambit_name(port_ambit, new_name)
+
+    # 7. PAR-sensor calibration (needs the DC source + PAR-reference MiniPAR)
     if port_ref and port_dc:
         print("\n=== PAR sensor calibration ===")
         calibrate_par_sensor(port_ambit, port_ref, port_dc)
@@ -184,29 +254,29 @@ def main():
                                            ("Kiprim DC source", port_dc)) if p is None)
         print(f"\n[skip] PAR sensor calibration - missing: {missing}")
 
-    # 6. Actinic-LED calibration (needs the Emit_LED MiniPAR)
+    # 8. Actinic-LED calibration (needs the Emit_LED MiniPAR)
     if port_emit:
         print("\n=== Actinic LED calibration ===")
         calibrate_led(port_ambit, port_emit)
     else:
         print("\n[skip] Actinic LED calibration - missing: Emit_LED MiniPAR")
 
-    # 7. Final state
+    # 9. Final state
     print("\n=== Ambit after calibration ===")
     info_postcalibration = helpers.ambit_reboot(port_ambit)
     print(info_postcalibration)
 
-    # 8. Build the calibration payload (aborts with a warning if either dump is empty)
+    # 10. Build the calibration payload (aborts with a warning if either dump is empty)
     print("\n=== Calibration payload ===")
     payload = helpers.make_calibration_payload(info_precalibration, info_postcalibration)
     print(payload)
 
-    # 9. Save the payload to ./calibrations/<YYYY-MM-DD_HH-MM-SS>_<MAC>.json
+    # 11. Save the payload to ./calibrations/<YYYY-MM-DD_HH-MM-SS>_<MAC>.json
     print("\n=== Saving payload ===")
     save_payload(payload, mac=info_postcalibration.MAC)
     # return payload
 
-    # 10. (Optional) Publish the payload to AWS IoT Core via MQTT
+    # 12. (Optional) Publish the payload to AWS IoT Core via MQTT
     helpers.publish_payload_mqtt5(
         payload,
         topic="experiment/data_ingest/v1/993ae58e-2e87-45ef-96e1-5bbdb0916817/ambit/v1.0/ambit_calibration_1/1234556",
