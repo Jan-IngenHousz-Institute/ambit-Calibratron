@@ -1,0 +1,10 @@
+[project]
+name = "python"
+version = "0.1.0"
+description = "ambit_test"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "esptool>=5.2.0",
+    "pyserial>=3.5",
+]
