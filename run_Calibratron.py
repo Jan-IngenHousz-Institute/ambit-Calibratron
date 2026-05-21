@@ -70,8 +70,9 @@ HERE             = os.path.dirname(os.path.abspath(helpers.__file__))
 FIRMWARE_DIR     = os.path.join(HERE, "firmware_ambit")   # Ambit firmware images to flash
 CALIBRATIONS_DIR = os.path.join(HERE, "calibrations")   # where save_payload() writes
 
-PAR_CAL_CURRENTS = [0.2, 0.4, 0.8, 1.0, 1.6, 0.0]   # A, DC source -> calibration lamp
-LED_CAL_SETTINGS = [10, 20, 60, 90, 150, 0]          # Ambit actinic LED steps
+PAR_CAL_CURRENTS = [0.8, 2.4, 3.0, 4.0, 6.6, 0.0]   # A, DC source -> calibration lamp
+# PAR_CAL_CURRENTS = [0.2, 0.4, 0.8, 1.0, 1.6, 0.0]   # A, DC source -> calibration lamp
+LED_CAL_SETTINGS = [10, 20, 60, 90, 150, 250, 0]          # Ambit actinic LED steps
 UPLOAD_GAINS     = True   # set False to preview the fit/plot without writing to the device
 FORCE_FLASH_FIRMWARE   = False     # True -> always re-flash, regardless of current version
 AMBIT_FW_VERSION       = "0.0.4"   # expected Ambit firmware; flash only if the device differs
