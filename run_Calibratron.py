@@ -75,7 +75,7 @@ PAR_CAL_CURRENTS = [0.8, 2.4, 3.0, 4.0, 6.6, 0.0]   # A, DC source -> calibratio
 LED_CAL_SETTINGS = [10, 20, 60, 90, 150, 250, 0]          # Ambit actinic LED steps
 UPLOAD_GAINS     = True   # set False to preview the fit/plot without writing to the device
 FORCE_FLASH_FIRMWARE   = False     # True -> always re-flash, regardless of current version
-AMBIT_FW_VERSION       = "0.0.4"   # expected Ambit firmware; flash only if the device differs
+AMBIT_FW_VERSION       = "0.0.5"   # expected Ambit firmware; flash only if the device differs
 RENAME_AMBIT = True
 
 
