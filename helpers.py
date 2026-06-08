@@ -109,7 +109,7 @@ def serial_ports():
     return list(result)
 
 
-def findDevice(question="hello", answer="", flush=True, timeout=5):
+def findDevice(question="hello\r\n", answer="", flush=True, timeout=5, verbose=False):
     """
     Find Ambit device on available serial ports by handshake.
 
@@ -120,42 +120,55 @@ def findDevice(question="hello", answer="", flush=True, timeout=5):
     :param answer: The substring expected in the device response
     :param flush: Whether to flush the serial buffer before sending (default: True)
     :param timeout: The read timeout for the serial port in seconds (default: 5)
+    :param verbose: When True, log the full handshake response (boot log and
+        all); otherwise only the port that matched is reported (default: False)
     :return: The port where the device was found, or None if not found
     """
     for port in serial_ports():
         try:
-            with serial.Serial(port, baudrate=115200, timeout=timeout) as ser:
-                # Windows-specific: Set DTR and RTS signals (needed for some devices)
+            with serial.Serial(port, baudrate=115200, timeout=0.2) as ser:
+                # Asserting DTR/RTS reboots devices like the ESP32-C3, so the
+                # first thing we see is the boot log, not the handshake reply.
                 ser.dtr = True
                 ser.rts = True
-                
+
                 if flush:
-                    ser.flush()
                     ser.reset_input_buffer()
                     ser.reset_output_buffer()
-                    time.sleep(0.5)
-                
-                # Extra delay on Windows to allow device to respond after signals set
-                if sys.platform.startswith('win'):
-                    time.sleep(0.3)
-                    
-                ser.write(question.encode())
-                time.sleep(0.8)  # Increased timing
-                
-                # Use read_all() instead of readline() to handle responses without newlines
-                msg_bytes = ser.read_all()
-                
-                # Decode with unicode_escape encoding for special characters
-                try:
-                    msg = msg_bytes.decode(encoding='unicode_escape')
-                except:
-                    msg = msg_bytes.decode(errors='replace')
-                    
-                logger.debug("Received message: %s, port: %s", msg.strip(), port)
 
-                if answer in msg:
-                    logger.info("Found device at: %s, answer: %s", port, msg)
-                    return port
+                # Give the DTR/RTS-triggered reboot a moment to start, then keep
+                # re-sending the question and accumulating output until the
+                # answer shows up or we run out of time. A single short read
+                # would only catch the boot log and miss the (later) reply.
+                time.sleep(0.3)
+                deadline = time.time() + timeout
+                msg = ""
+                while time.time() < deadline:
+                    ser.write(question.encode())
+                    time.sleep(0.3)
+                    msg_bytes = ser.read_all()
+                    # Decode with unicode_escape for special characters; fall
+                    # back to replacing undecodable bytes (e.g. reset framing
+                    # noise) so a stray byte never aborts the scan.
+                    try:
+                        msg += msg_bytes.decode(encoding='unicode_escape')
+                    except Exception:
+                        msg += msg_bytes.decode(errors='replace')
+
+                    if answer and answer in msg:
+                        if verbose:
+                            logger.info("Found device at: %s, answer: %s", port, msg)
+                        else:
+                            logger.info("Found device at: %s", port)
+                        return port
+
+                # No match on this port. Surface what it *did* say when verbose
+                # is on (otherwise this stays at debug level and is hidden), so
+                # the full response is visible even when the answer never shows.
+                if verbose:
+                    logger.info("No match on %s. Received: %s", port, msg.strip())
+                else:
+                    logger.debug("Received message: %s, port: %s", msg.strip(), port)
         except (OSError, serial.SerialException) as e:
             logger.debug("Cannot open %s: %s", port, e)
             _invalidate_port_cache()
@@ -174,7 +187,7 @@ BAUDRATE = 115200
 
 class AmbitProto:
     """Wire protocol for the Ambit device."""
-    HELLO       = "hello\n"
+    HELLO       = "hello\r\n"
     HELLO_ACK   = b"NEW"
     REBOOT      = "reboot\n"
     GET_PAR_RAW = "get_par\n"
@@ -222,6 +235,26 @@ def _ambit_query(port, cmd, decode="unicode_escape"):
         _wait_for_device_ready(ser)
         ser.write(cmd.encode())
         return ser.readline().decode(encoding=decode).strip()
+
+
+def _open_ambit_serial(port, timeout=1):
+    """Open the Ambit serial port WITHOUT triggering the device's auto-reset.
+
+    The flasher bridge wires DTR/RTS to the ESP32-C3 reset/boot pins, so the
+    usual "open then assert DTR/RTS" sequence reboots the device. That reboot
+    is what switches the actinic LED off right after ``arrun`` latches it on
+    (the ~100 ms "flash"). Setting DTR/RTS to a steady state *before* opening
+    avoids the reset edge, so a latched LED stays lit after the call returns
+    (verified: no boot log on open, close, or reopen).
+    """
+    ser = serial.Serial()
+    ser.port = port
+    ser.baudrate = BAUDRATE
+    ser.timeout = timeout
+    ser.dtr = False
+    ser.rts = False
+    ser.open()
+    return ser
 
 
 def _ambit_command(port, cmd, settle=0.2, verify_ready=True):
@@ -983,16 +1016,22 @@ def publish_payload_mqtt5(payload, topic, certs_dir, endpoint, *,
 
 def set_ambit_led(port, ledCurrent):
     """
-    Set LED current on Ambit device and run measurement.
+    Turn the actinic LED on at the given current and leave it on.
+
+    ``arrun`` latches the LED on; the device keeps it lit until it is reset or
+    told otherwise. The port is opened without resetting the device (see
+    :func:`_open_ambit_serial`), so the LED stays on after this call returns
+    instead of being switched off by a reboot. Call with ``ledCurrent=0`` to
+    switch the LED off.
 
     :param port: Serial port of the Ambit device
-    :param ledCurrent: LED current value (integer)
+    :param ledCurrent: LED current value (integer); 0 turns the LED off
     """
-    _ambit_command(
-        port,
-        AmbitProto.LED_RUN.format(led=ledCurrent),
-        verify_ready=False,
-    )
+    with _open_ambit_serial(port) as ser:
+        ser.reset_input_buffer()
+        _wait_for_device_ready(ser)
+        ser.write(AmbitProto.LED_RUN.format(led=ledCurrent).encode())
+        time.sleep(0.2)
 
 
 # ============================================================================
