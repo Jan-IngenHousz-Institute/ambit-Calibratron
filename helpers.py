@@ -626,6 +626,7 @@ def make_calibration_payload(info_precalibration=None, info_postcalibration=None
                              device_id=None, device_name=None,
                              firmware_version=None, device_firmware=None,
                              device_version="1", protocol_id="CALIBRATION",
+                             par_cal=None, led_cal=None,
                              indent=2):
     """Build the JSON calibration-upload payload from the pre/post AmbitInfo dumps.
 
@@ -635,6 +636,10 @@ def make_calibration_payload(info_precalibration=None, info_postcalibration=None
 
     :param info_precalibration: AmbitInfo captured before calibration
     :param info_postcalibration: AmbitInfo captured after calibration
+    :param par_cal: PAR-sensor calibration block (x/y arrays + labels + slope/r2)
+        from calibrate_par_sensor(); ``None`` (-> JSON null) if it was skipped
+    :param led_cal: actinic-LED calibration block, same shape, from
+        calibrate_led(); ``None`` if it was skipped
     :param indent: json.dumps indent (None for a compact one-line payload)
     :return: a JSON string ready to send
     :raises ValueError: if either AmbitInfo is missing / never populated
@@ -671,6 +676,8 @@ def make_calibration_payload(info_precalibration=None, info_postcalibration=None
                     {
                         "METADATA_PRECALIBRATION":  info_precalibration.to_dict(),
                         "METADATA_POSTCALIBRATION": info_postcalibration.to_dict(),
+                        "PAR_SENSOR_CALIBRATION":   par_cal,
+                        "LED_CALIBRATION":          led_cal,
                     }
                 ],
             }

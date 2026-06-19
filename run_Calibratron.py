@@ -75,14 +75,14 @@ PAR_CAL_CURRENTS = [0.8, 2.4, 3.0, 4.0, 6.6, 0.0]   # A, DC source -> calibratio
 LED_CAL_SETTINGS = [10, 20, 60, 90, 150, 250, 0]          # Ambit actinic LED steps
 UPLOAD_GAINS     = True   # set False to preview the fit/plot without writing to the device
 FORCE_FLASH_FIRMWARE   = False     # True -> always re-flash, regardless of current version
-AMBIT_FW_VERSION       = "0.0.5"   # expected Ambit firmware; flash only if the device differs
+AMBIT_FW_VERSION       = "0.0.6"   # expected Ambit firmware; flash only if the device differs
 RENAME_AMBIT = True
 
 
 def _detect_ambit_version():
     """Discover an Ambit and return its firmware version string.
 
-    :return: the firmware version (e.g. "0.0.5"), or None if no Ambit responds
+    :return: the firmware version (e.g. "0.0.6"), or None if no Ambit responds
         on any serial port.
     """
     helpers._invalidate_port_cache()   # COM topology may have changed
@@ -180,7 +180,8 @@ def calibrate_par_sensor(port_ambit, port_ref, port_dc, currents=PAR_CAL_CURRENT
     """Sweep the calibration lamp, fit Ambit-raw PAR vs MiniPAR reference, show
     the plot, and (optionally) upload the slope as the Ambit PAR gain.
 
-    :return: (slope, r2)
+    :return: a JSON-ready dict with the sweep (x/y arrays + axis labels), the
+        fitted slope and r2.
     """
     ref_par, ambit_raw = [], []
     for I in currents:
@@ -195,6 +196,12 @@ def calibrate_par_sensor(port_ambit, port_ref, port_dc, currents=PAR_CAL_CURRENT
     r2 = helpers.r_squared(y, np.polyval(coeffs, x))
     slope = float(coeffs[0])
 
+    cal = {
+        "x": x.tolist(), "x_label": "Ambit PAR (raw)",
+        "y": y.tolist(), "y_label": "MiniPAR PAR (reference)",
+        "slope": slope, "r2": float(r2),
+    }
+
     old = helpers.ambit_reboot(port_ambit).light_slope
     print(f"[PAR cal] fit slope={slope:.4f}  R^2={r2:.6f}  (current light_slope={old:.4f})")
     helpers.plot_data_and_fit(x, y, coeffs, r2,
@@ -204,14 +211,15 @@ def calibrate_par_sensor(port_ambit, port_ref, port_dc, currents=PAR_CAL_CURRENT
         helpers.set_par_gain(port_ambit, slope)
         new = helpers.ambit_reboot(port_ambit).light_slope
         print(f"[PAR cal] uploaded PAR gain: {old:.4f} -> {new:.4f}")
-    return slope, r2
+    return cal
 
 
 def calibrate_led(port_ambit, port_emit, settings=LED_CAL_SETTINGS, upload=UPLOAD_GAINS):
     """Sweep the Ambit actinic LED, fit measured PAR vs LED setting, show the
     plot, and (optionally) upload the slope as the Ambit LED gain.
 
-    :return: (slope, r2)
+    :return: a JSON-ready dict with the sweep (x/y arrays + axis labels), the
+        fitted slope and r2.
     """
     led_setting, measured = [], []
     for s in settings:
@@ -225,6 +233,12 @@ def calibrate_led(port_ambit, port_emit, settings=LED_CAL_SETTINGS, upload=UPLOA
     r2 = helpers.r_squared(y, np.polyval(coeffs, x))
     slope = float(coeffs[0])
 
+    cal = {
+        "x": x.tolist(), "x_label": "MiniPAR PAR (over LED)",
+        "y": y.tolist(), "y_label": "Ambit LED setting",
+        "slope": slope, "r2": float(r2),
+    }
+
     old = helpers.ambit_reboot(port_ambit).act_led_coeff
 
     if r2 < 0.99:
@@ -232,14 +246,14 @@ def calibrate_led(port_ambit, port_emit, settings=LED_CAL_SETTINGS, upload=UPLOA
         helpers.plot_data_and_fit(x, y, coeffs, r2,
                                 xlabel="MiniPAR PAR (over LED)", ylabel="Ambit LED setting")
         print("[LED cal] uploading old values due to poor fit quality")
-        return old, r2
+        return cal
 
     print(f"[LED cal] fit slope={slope:.4f}  R^2={r2:.6f}  (current act_led_coeff={old:.4f})")
     if upload:
         helpers.set_ambit_led_gain(port_ambit, slope)
         new = helpers.ambit_reboot(port_ambit).act_led_coeff
         print(f"[LED cal] uploaded LED gain: {old:.4f} -> {new:.4f}")
-    return slope, r2
+    return cal
 
 
 def main():
@@ -292,18 +306,20 @@ def main():
         helpers.set_ambit_name(port_ambit, new_name)
 
     # 7. PAR-sensor calibration (needs the DC source + PAR-reference MiniPAR)
+    par_cal = None
     if port_ref and port_dc:
         print("\n=== PAR sensor calibration ===")
-        calibrate_par_sensor(port_ambit, port_ref, port_dc)
+        par_cal = calibrate_par_sensor(port_ambit, port_ref, port_dc)
     else:
         missing = ", ".join(n for n, p in (("Par_REF MiniPAR", port_ref),
                                            ("Kiprim DC source", port_dc)) if p is None)
         print(f"\n[skip] PAR sensor calibration - missing: {missing}")
 
     # 8. Actinic-LED calibration (needs the Emit_LED MiniPAR)
+    led_cal = None
     if port_emit:
         print("\n=== Actinic LED calibration ===")
-        calibrate_led(port_ambit, port_emit)
+        led_cal = calibrate_led(port_ambit, port_emit)
     else:
         print("\n[skip] Actinic LED calibration - missing: Emit_LED MiniPAR")
 
@@ -314,7 +330,10 @@ def main():
 
     # 10. Build the calibration payload (aborts with a warning if either dump is empty)
     print("\n=== Calibration payload ===")
-    payload = helpers.make_calibration_payload(info_precalibration, info_postcalibration)
+    payload = helpers.make_calibration_payload(
+        info_precalibration, info_postcalibration,
+        par_cal=par_cal, led_cal=led_cal,
+    )
     print(payload)
 
     # 11. Save the payload to ./calibrations/<YYYY-MM-DD_HH-MM-SS>_<MAC>.json
