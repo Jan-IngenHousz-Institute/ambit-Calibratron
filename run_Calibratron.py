@@ -11,7 +11,7 @@ Whatever isn't connected is reported and that calibration step is skipped, so
 the script is still useful with only the Ambit plugged in.
 """
 
-import os, sys, json, time, re, importlib, subprocess, warnings
+import os, sys, json, time, re, importlib, subprocess, warnings, urllib.error
 from datetime import datetime
 
 
@@ -60,6 +60,7 @@ _ensure_requirements()   # install missing deps before the third-party imports b
 
 import numpy as np
 import helpers; importlib.reload(helpers)
+import firmware_fetch; importlib.reload(firmware_fetch)
 
 # ---- paths / tunables -----------------------------------------------------
 # Anchor to the directory that contains helpers.py (== this script's folder).
@@ -67,62 +68,91 @@ import helpers; importlib.reload(helpers)
 # __file__ may be a relative path and the kernel CWD is the workspace root,
 # which would otherwise make os.path.abspath(__file__) point to the wrong dir.
 HERE             = os.path.dirname(os.path.abspath(helpers.__file__))
-FIRMWARE_DIR     = os.path.join(HERE, "firmware_ambit")   # Ambit firmware images to flash
+# Downloaded Ambit firmware releases land here as firmware_cache/<version>/
+# (manifest.json + images); git-ignored, populated by firmware_fetch.
+FIRMWARE_CACHE_DIR = os.path.join(HERE, "firmware_cache")
 CALIBRATIONS_DIR = os.path.join(HERE, "calibrations")   # where save_payload() writes
 
 PAR_CAL_CURRENTS = [0.8, 2.4, 3.0, 4.0, 6.6, 0.0]   # A, DC source -> calibration lamp
 # PAR_CAL_CURRENTS = [0.2, 0.4, 0.8, 1.0, 1.6, 0.0]   # A, DC source -> calibration lamp
 LED_CAL_SETTINGS = [10, 20, 60, 90, 150, 250, 0]          # Ambit actinic LED steps
 UPLOAD_GAINS     = True   # set False to preview the fit/plot without writing to the device
-FORCE_FLASH_FIRMWARE   = False     # True -> always re-flash, regardless of current version
-AMBIT_FW_VERSION       = "0.0.6"   # expected Ambit firmware; flash only if the device differs
+FORCE_FLASH_FIRMWARE   = False     # True -> always re-flash, even if the device is up to date
 RENAME_AMBIT = True
+
+# The expected firmware version is no longer pinned here: it is whatever the
+# latest published ambit-iot release says (see firmware_fetch.fetch_latest).
+
+# Ambit firmware >= 0.1.0 answers `hello` with "NEW <name> Ready FW:<version>",
+# so the version can be read without the (slower, reboot-triggering) boot dump.
+_HELLO_FW_RE = re.compile(r"FW:([0-9][^\s]+)")
 
 
 def _detect_ambit_version():
     """Discover an Ambit and return its firmware version string.
 
-    :return: the firmware version (e.g. "0.0.6"), or None if no Ambit responds
+    Reads the version from the ``hello`` reply when the device is new enough to
+    include it, and falls back to the boot dump for older firmware, which only
+    prints ``FW: x.y.z`` while rebooting.
+
+    :return: the firmware version (e.g. "0.1.0"), or None if no Ambit responds
         on any serial port.
     """
     helpers._invalidate_port_cache()   # COM topology may have changed
     port = helpers.findDevice(question="hello\n", answer="NEW", flush=True, timeout=4)
     if port is None:
         return None
+
+    try:
+        reply = helpers._ambit_query(port, helpers.AmbitProto.HELLO)
+    except Exception as exc:                      # serial hiccup: try the boot dump
+        print(f"[flash] could not read the hello reply on {port}: {exc}")
+        reply = ""
+    match = _HELLO_FW_RE.search(reply or "")
+    if match:
+        return match.group(1).strip()
+
+    # Old firmware: no version in the hello reply, only in the boot dump.
     fw = helpers.ambit_reboot(port).FW
     return fw.decode(errors="replace").strip() if fw else None
 
 
-def flash_firmware(force_flash=False, version=None):
-    """(Re)flash the Ambit firmware via helpers.flash_ambit_firmware().
+def flash_firmware(force_flash=False, current_version=None, cache_root=FIRMWARE_CACHE_DIR):
+    """Fetch the latest published Ambit firmware and flash it if needed.
 
-    Uses the firmware images in FIRMWARE_DIR; no external uploader script is
-    involved. helpers.flash_ambit_firmware() locates the flasher COM port,
-    opens it for esptool, and closes it again, so the port is free for
-    discovery afterwards.
+    The images come from the newest ambit-iot GitHub release, downloaded into
+    ``cache_root/<version>/`` by firmware_fetch (which falls back to the newest
+    complete cache entry when GitHub is unreachable). helpers.flash_ambit_firmware()
+    locates the flasher COM port, opens it for esptool, and closes it again, so
+    the port is free for discovery afterwards.
 
     Flashing is decided as follows:
-      - ``force_flash=True`` -> always flash, regardless of the current version.
-      - ``version`` given    -> detect the Ambit's current firmware and flash
-        only when it differs from ``version``, or when no Ambit is detected.
-        After flashing, the device is rebooted and a warning is raised if the
-        running version still isn't ``version``.
-      - neither given        -> flash only when an "invalid header" is detected
-        on boot.
+      - ``force_flash=True``            -> always flash.
+      - device version != release       -> flash (also when no Ambit answers).
+      - device version == release       -> skip.
+    After a flash the device is re-read and a warning is raised if it still is
+    not running the release version.
 
-    :param force_flash: re-flash even when the current firmware looks valid;
-        otherwise flashing happens only on a version mismatch / invalid header.
-    :param version: expected firmware version string (e.g. "0.0.5"). When set,
-        the Ambit is flashed only if its current firmware differs from this.
+    :param force_flash: re-flash even when the device is already up to date.
+    :param current_version: firmware version already read from the device; when
+        None it is detected over serial.
+    :param cache_root: firmware cache folder to download into.
     :return: 0 on success (including a deliberately skipped flash), 1 on failure.
     """
+    try:
+        version, firmware_dir = firmware_fetch.fetch_latest(cache_root)
+    except (urllib.error.URLError, RuntimeError, OSError) as exc:
+        print(f"[flash] could not obtain the Ambit firmware: {exc}")
+        return 1
+    print(f"[flash] latest published firmware: {version} ({firmware_dir})")
+
     # Decide whether the Ambit needs flashing, and whether to force it
     # (a version mismatch flashes even with force_flash=False).
     should_force = force_flash
     if force_flash:
         print("[flash] force_flash=True - flashing regardless of current version")
-    elif version is not None:
-        current = _detect_ambit_version()
+    else:
+        current = current_version or _detect_ambit_version()
         if current is None:
             print(f"[flash] no Ambit detected - flashing firmware {version}")
             should_force = True
@@ -130,21 +160,19 @@ def flash_firmware(force_flash=False, version=None):
             print(f"[flash] Ambit already runs firmware {current} - skipping flash")
             return 0
         else:
-            print(f"[flash] Ambit runs firmware {current!r}, expected {version!r} - flashing")
+            print(f"[flash] Ambit runs firmware {current!r}, latest is {version!r} - flashing")
             should_force = True
-    else:
-        print("[flash] no target version - flashing only on invalid header")
 
     try:
-        flashed = helpers.flash_ambit_firmware(firmware_dir=FIRMWARE_DIR,
+        flashed = helpers.flash_ambit_firmware(firmware_dir=firmware_dir,
                                                force_flash=should_force)
     except (FileNotFoundError, RuntimeError) as exc:
         print(f"[flash] flashing failed: {exc}")
         return 1
     print(f"[flash] {'firmware flashed' if flashed else 'flash skipped'}")
 
-    # Verify the freshly-flashed firmware matches the expected version.
-    if version is not None and flashed:
+    # Verify the freshly-flashed firmware matches the release we just fetched.
+    if flashed:
         time.sleep(1.0)   # let the device finish rebooting
         running = _detect_ambit_version()
         if running != version:
@@ -258,13 +286,13 @@ def calibrate_led(port_ambit, port_emit, settings=LED_CAL_SETTINGS, upload=UPLOA
 
 def main():
 
-    # 0. Flash the Ambit firmware via firmware_ambit/uploader.py
+    # 0. Flash the Ambit with the latest published firmware release
     if FORCE_FLASH_FIRMWARE:
-        print("WARNING: FORCE_FLASH_FIRMWARE is True - the device will be re-flashed even if it already runs the expected firmware")
+        print("WARNING: FORCE_FLASH_FIRMWARE is True - the device will be re-flashed even if it already runs the latest firmware")
         print("=== Flashing firmware ===")
-        rc = flash_firmware(force_flash=FORCE_FLASH_FIRMWARE, version=AMBIT_FW_VERSION)
+        rc = flash_firmware(force_flash=True)
         if rc != 0:
-            raise SystemExit(f"Firmware flashing failed (uploader.py exit code {rc})")
+            raise SystemExit(f"Firmware flashing failed (exit code {rc})")
         time.sleep(1.0)            # let the device finish rebooting
         helpers._invalidate_port_cache()   # COM topology may have changed
 
@@ -289,13 +317,21 @@ def main():
     port_emit = helpers.findDevice(question="get_name\n", answer="Emit_LED", flush=True, timeout=2)
     port_dc   = helpers.findDevice(question="*IDN?\n",    answer="KIPRIM",   flush=True, timeout=2)
 
-    # 5. Flash new version
-    current_fw = info_precalibration.FW.decode(errors="replace").strip()
-    if AMBIT_FW_VERSION and current_fw != AMBIT_FW_VERSION:
-        print(f"\n=== Firmware version mismatch: running {current_fw!r}, expected {AMBIT_FW_VERSION!r} ===")
-        rc = flash_firmware(force_flash=FORCE_FLASH_FIRMWARE, version=AMBIT_FW_VERSION)
-        if rc != 0:
-            raise SystemExit(f"Firmware flashing failed (uploader.py exit code {rc})")
+    # 5. Flash the latest release if the device is behind it. The version was
+    #    already read from the boot dump above, so pass it in instead of
+    #    re-probing the serial port. force_flash stays off here even when
+    #    FORCE_FLASH_FIRMWARE is set: step 0 has already done that flash and
+    #    forcing again would write the same images twice.
+    print("\n=== Firmware check ===")
+    current_fw = info_precalibration.FW.decode(errors="replace").strip() or None
+    rc = flash_firmware(force_flash=False, current_version=current_fw)
+    if rc != 0:
+        # A responding Ambit can still be calibrated, so an unreachable release
+        # (offline bench, no release published yet) must not kill the session -
+        # unlike the explicit FORCE_FLASH_FIRMWARE run above, which is *about*
+        # flashing and does abort.
+        print("[flash] continuing the calibration with the firmware already on the device")
+    else:
         time.sleep(1.0)            # let the device finish rebooting
         helpers._invalidate_port_cache()   # COM topology may have changed
 
