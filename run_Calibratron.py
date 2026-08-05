@@ -81,7 +81,7 @@ FORCE_FLASH_FIRMWARE   = False     # True -> always re-flash, even if the device
 RENAME_AMBIT = True
 
 # The expected firmware version is no longer pinned here: it is whatever the
-# latest published ambit-iot release says (see firmware_fetch.fetch_latest).
+# latest published public AMBIT release says (see firmware_fetch.fetch_latest).
 
 # Ambit firmware >= 0.1.0 answers `hello` with "NEW <name> Ready FW:<version>",
 # so the version can be read without the (slower, reboot-triggering) boot dump.
@@ -120,7 +120,7 @@ def _detect_ambit_version():
 def flash_firmware(force_flash=False, current_version=None, cache_root=FIRMWARE_CACHE_DIR):
     """Fetch the latest published Ambit firmware and flash it if needed.
 
-    The images come from the newest ambit-iot GitHub release, downloaded into
+    The images come from the newest public AMBIT GitHub release, downloaded into
     ``cache_root/<version>/`` by firmware_fetch (which falls back to the newest
     complete cache entry when GitHub is unreachable). helpers.flash_ambit_firmware()
     locates the flasher COM port, opens it for esptool, and closes it again, so

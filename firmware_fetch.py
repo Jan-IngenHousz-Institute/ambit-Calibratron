@@ -1,4 +1,4 @@
-"""Fetch the compiled Ambit firmware from the ambit-iot GitHub releases.
+"""Fetch compiled Ambit firmware from the public AMBIT GitHub releases.
 
 The bench used to carry a vendored copy of the firmware images in
 ``firmware_ambit/``, which meant every firmware bump needed a commit here and
@@ -73,7 +73,7 @@ if not logger.handlers:
 
 # Firmware source of truth. Its release pipeline publishes manifest.json plus
 # one .bin per flash region for every tagged release.
-FIRMWARE_REPO = "Jan-IngenHousz-Institute/ambit-iot"
+FIRMWARE_REPO = "Jan-IngenHousz-Institute/ambit"
 LATEST_RELEASE_URL = f"https://api.github.com/repos/{FIRMWARE_REPO}/releases/latest"
 
 MANIFEST_NAME = "manifest.json"

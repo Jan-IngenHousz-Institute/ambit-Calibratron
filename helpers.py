@@ -703,7 +703,7 @@ def make_calibration_payload(info_precalibration=None, info_postcalibration=None
 # shelling out to any external uploader script.
 #
 # The images are no longer vendored in this repo. ``firmware_fetch.py`` pulls
-# the latest ambit-iot release into ``firmware_cache/<version>/`` and the folder
+# the latest public AMBIT release into ``firmware_cache/<version>/`` and the folder
 # it returns is what gets flashed. That folder always carries a ``manifest.json``
 # describing which file goes at which offset, so a layout change on the firmware
 # side (extra partition, renamed image, ...) needs no change here.
@@ -713,7 +713,7 @@ FLASHER_VID = 0x1A86
 FLASHER_PID = 0x55D4
 FLASHER_VIDPID = "1A86:55D4"
 
-# Release manifest that describes the flash layout; written by the ambit-iot
+# Release manifest that describes the flash layout; written by the public AMBIT
 # release pipeline and downloaded alongside the images.
 AMBIT_MANIFEST_NAME = "manifest.json"
 
@@ -902,7 +902,7 @@ def flash_ambit_firmware(firmware_dir=None, *, cache_root=None, port=None,
 
     :param firmware_dir: folder holding manifest.json + the firmware images
         (normally the ``firmware_cache/<version>/`` folder returned by
-        ``firmware_fetch.fetch_latest``); if None, the latest ambit-iot release
+        ``firmware_fetch.fetch_latest``); if None, the latest public AMBIT release
         is fetched into ``cache_root`` first
     :param cache_root: firmware cache folder used when ``firmware_dir`` is None
         (default: ``<repo>/firmware_cache``)
