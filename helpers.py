@@ -196,14 +196,19 @@ class AmbitProto:
     SET_ACT     = "set_act, {coeff:.4f}\n"
     SET_NAME    = "set_name,{name}\n"
     LED_RUN     = "arrun1,1,1,2,0,0,1,0,1,{led:d},1,\n, \n"
+    SET_CURRENTS = "set_currents,{i620:d},{i720:d},{ir:d},\n"
+    # one type-2 line (no IR reflect), far-red off, sample number / frequency
+    # as hi,lo bytes, actinic setting, ambient channels at every point
+    ARRUN2       = "arrun2,1,0,2,0,{nh:d},{nl:d},{fh:d},{fl:d},{act:d},1,\n, \n"
 
 
 class MiniParProto:
     """Wire protocol for the MiniPAR device."""
-    GET_PAR_RAW = "par_raw\n"
-    GET_PAR_CAL = "par\n"
-    GET_NAME    = "get_name\n"
-    SET_NAME    = "set_name,{name}\n"
+    GET_PAR_RAW  = "par_raw\n"
+    GET_PAR_CAL  = "par\n"
+    GET_SPEC_RAW = "spec_raw\n"
+    GET_NAME     = "get_name\n"
+    SET_NAME     = "set_name,{name}\n"
 
 
 class DCSourceProto:
@@ -235,6 +240,22 @@ def _ambit_query(port, cmd, decode="unicode_escape"):
         _wait_for_device_ready(ser)
         ser.write(cmd.encode())
         return ser.readline().decode(encoding=decode).strip()
+
+
+def _ambit_query_lines(port, cmd, n_lines=2, timeout=2.0, decode="unicode_escape"):
+    """Like _ambit_query, but read a multi-line response.
+
+    Opens with a read timeout so a missing trailing line degrades to "" instead
+    of blocking forever (e.g. firmware that doesn't print it).
+
+    :return: list of n_lines decoded+stripped lines.
+    """
+    with serial.Serial(port, baudrate=BAUDRATE, timeout=timeout) as ser:
+        ser.flush()
+        _wait_for_device_ready(ser)
+        ser.write(cmd.encode())
+        return [ser.readline().decode(encoding=decode).strip()
+                for _ in range(n_lines)]
 
 
 def _open_ambit_serial(port, timeout=1):
@@ -295,16 +316,116 @@ def get_par_MP(port, raw=False):
     return float(_query(port, cmd))
 
 
-def get_par_AMB(port, raw=False):
+def get_spec_raw_MP(port):
+    """
+    Read the raw (unscaled) spectrometer channel counts from a MiniPAR device.
+
+    Sends 'spec_raw'; the MiniPAR answers '<model>,<c0>,...,<c9>' with the
+    channels in order F1_415..F8_680, CLEAR, NIR.
+
+    :param port: Serial port of the MiniPAR device
+    :return: {"model": str, "counts": [int, ...]}, or None if the firmware
+        doesn't support the command / the reply doesn't parse.
+    """
+    resp = _query(port, MiniParProto.GET_SPEC_RAW)
+    try:
+        model, *counts = resp.split(",")
+        if model.startswith("error") or not counts:
+            raise ValueError(resp)
+        return {"model": model, "counts": [int(c) for c in counts]}
+    except ValueError:
+        print(f"[spec_raw] MiniPAR raw spectrum unavailable (reply: {resp!r})")
+        return None
+
+
+def get_par_AMB(port, raw=False, return_spec=False):
     """
     Read PAR value from Ambit device.
 
+    The firmware answers 'get_par'/'PAR' with two lines: the PAR value, then
+    the 10 spectrometer channel values (F1_415..F8_680, NIR, CLEAR) as CSV.
+    Both lines are always read so the serial buffer stays clean; the channel
+    values are pre-scaled by the firmware Spec_COE factors and wrap at uint16.
+
     :param port: Serial port of the Ambit device
     :param raw: If True, request raw PAR value; if False, request calibrated value
-    :return: PAR value as float
+    :param return_spec: If True, also return the spectrometer channel values
+    :return: PAR value as float, or (par, channels) if return_spec=True where
+        channels is a list of 10 ints (None if the channel line didn't parse)
     """
     cmd = AmbitProto.GET_PAR_RAW if raw else AmbitProto.GET_PAR_CAL
-    return float(_ambit_query(port, cmd))
+    par_line, spec_line = _ambit_query_lines(port, cmd, n_lines=2)
+    par = float(par_line)
+    if not return_spec:
+        return par
+    try:
+        spec = [int(v) for v in spec_line.split(",")]
+    except ValueError:
+        print(f"[get_par] Ambit channel line didn't parse (reply: {spec_line!r})")
+        spec = None
+    return par, spec
+
+
+def record_arrun_AMB(port, actinic=0, num_points=5, freq=10, timeout=15.0):
+    """
+    Record an ADPD array run on the Ambit and return the parsed data arrays.
+
+    Sends 'set_currents,0,0,0' (ADPD pulse LEDs dark, so the detector records
+    only the incident light) followed by an 'arrun2' trace, both over a single
+    port-open session: opening the port resets the device, so a separate open
+    would undo the zeroed currents. Note the run drives the actinic LED per
+    ``actinic`` (firmware forces it OFF when <= 3) and leaves it off afterwards.
+
+    The device replies with one 'Data:<tag>,Length:N\\t<v>,<v>,...' line per
+    channel buffer (env, s_630, r_630, sun, leaf, s_730, r_730) and a final
+    'Data sent'.
+
+    :param port: Serial port of the Ambit device
+    :param actinic: actinic LED setting driven during the run (0 = off)
+    :param num_points: samples to record
+    :param freq: sampling frequency in Hz
+    :param timeout: overall seconds to wait for the data dump
+    :return: {"actinic", "num_points", "freq_hz", "data": {tag: [ints]}},
+        or None if no data arrived.
+    """
+    nh, nl = divmod(int(num_points), 256)
+    fh, fl = divmod(int(freq), 256)
+    data, got_end = {}, False
+    with serial.Serial(port, baudrate=BAUDRATE, timeout=2.0) as ser:
+        ser.flush()
+        _wait_for_device_ready(ser)
+
+        ser.write(AmbitProto.SET_CURRENTS.format(i620=0, i720=0, ir=0).encode())
+        echo = ser.readline()
+        if b"Currents set" not in echo:
+            print(f"[arrun] unexpected set_currents echo: {echo!r}")
+
+        ser.write(AmbitProto.ARRUN2.format(nh=nh, nl=nl, fh=fh, fl=fl,
+                                           act=int(actinic)).encode())
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            raw = ser.readline()
+            if not raw:
+                continue
+            line = raw.decode("utf-8", errors="replace").strip()
+            if line.startswith("Data:"):
+                head, _, values = line.partition("\t")
+                tag = head[len("Data:"):].split(",", 1)[0]
+                try:
+                    data[tag] = [int(v) for v in values.split(",") if v.strip()]
+                except ValueError:
+                    data[tag] = values          # keep unparseable payload as text
+            elif "Data sent" in line:
+                got_end = True
+                break
+
+    if not got_end:
+        print(f"[arrun] 'Data sent' not received within {timeout}s "
+              f"(got tags: {sorted(data)})")
+    if not data:
+        return None
+    return {"actinic": int(actinic), "num_points": int(num_points),
+            "freq_hz": int(freq), "data": data}
 
 
 # ============================================================================

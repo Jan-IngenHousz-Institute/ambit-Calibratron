@@ -181,14 +181,20 @@ def calibrate_par_sensor(port_ambit, port_ref, port_dc, currents=PAR_CAL_CURRENT
     the plot, and (optionally) upload the slope as the Ambit PAR gain.
 
     :return: a JSON-ready dict with the sweep (x/y arrays + axis labels), the
-        fitted slope and r2.
+        raw spectrometer channels of both devices, the fitted slope and r2.
     """
     ref_par, ambit_raw = [], []
+    ref_spec, ambit_spec, arrun = [], [], []
     for I in currents:
         helpers.set_current(port=port_dc, current=I)
         time.sleep(1.0)
         ref_par.append(helpers.get_par_MP(port_ref))
-        ambit_raw.append(helpers.get_par_AMB(port_ambit, raw=True))
+        ref_spec.append(helpers.get_spec_raw_MP(port_ref))
+        par, spec = helpers.get_par_AMB(port_ambit, raw=True, return_spec=True)
+        ambit_raw.append(par)
+        ambit_spec.append(spec)
+        # ADPD trace of the lamp at this intensity: pulse LEDs zeroed, actinic off
+        arrun.append(helpers.record_arrun_AMB(port_ambit, actinic=0))
     helpers.set_current(port=port_dc, current=0.0)
 
     x, y = np.array(ambit_raw), np.array(ref_par)
@@ -200,6 +206,16 @@ def calibrate_par_sensor(port_ambit, port_ref, port_dc, currents=PAR_CAL_CURRENT
         "x": x.tolist(), "x_label": "Ambit PAR (raw)",
         "y": y.tolist(), "y_label": "MiniPAR PAR (reference)",
         "slope": slope, "r2": float(r2),
+        "currents_A": list(currents),
+        "ambit_spec": ambit_spec,
+        "ambit_spec_channels": ["F1_415", "F2_445", "F3_480", "F4_515", "F5_555",
+                                "F6_590", "F7_630", "F8_680", "NIR", "CLEAR"],
+        "ambit_spec_note": "values pre-scaled by firmware Spec_COE {12,10,11,10,10,9,7,4,1,1}, uint16 wrap",
+        "ref_spec": ref_spec,
+        "ref_spec_channels": ["F1_415", "F2_445", "F3_480", "F4_515", "F5_555",
+                              "F6_590", "F7_630", "F8_680", "CLEAR", "NIR"],
+        "arrun": arrun,
+        "arrun_note": "per step: set_currents,0,0,0 then arrun2 (5 pts @ 10 Hz, ADPD pulse LEDs dark, actinic off)",
     }
 
     old = helpers.ambit_reboot(port_ambit).light_slope
@@ -219,13 +235,18 @@ def calibrate_led(port_ambit, port_emit, settings=LED_CAL_SETTINGS, upload=UPLOA
     plot, and (optionally) upload the slope as the Ambit LED gain.
 
     :return: a JSON-ready dict with the sweep (x/y arrays + axis labels), the
-        fitted slope and r2.
+        raw spectrometer channels of the reference MiniPAR, the fitted slope
+        and r2.
     """
-    led_setting, measured = [], []
+    led_setting, measured, ref_spec, arrun = [], [], [], []
     for s in settings:
         helpers.set_ambit_led(port_ambit, s)
         time.sleep(0.2)
         measured.append(helpers.get_par_MP(port_emit))
+        ref_spec.append(helpers.get_spec_raw_MP(port_emit))
+        # ADPD trace with the actinic LED driven at this setting; must come after
+        # the MiniPAR reads (opening the Ambit port resets the latched LED)
+        arrun.append(helpers.record_arrun_AMB(port_ambit, actinic=s))
         led_setting.append(s)
 
     x, y = np.array(measured), np.array(led_setting)
@@ -237,6 +258,11 @@ def calibrate_led(port_ambit, port_emit, settings=LED_CAL_SETTINGS, upload=UPLOA
         "x": x.tolist(), "x_label": "MiniPAR PAR (over LED)",
         "y": y.tolist(), "y_label": "Ambit LED setting",
         "slope": slope, "r2": float(r2),
+        "ref_spec": ref_spec,
+        "ref_spec_channels": ["F1_415", "F2_445", "F3_480", "F4_515", "F5_555",
+                              "F6_590", "F7_630", "F8_680", "CLEAR", "NIR"],
+        "arrun": arrun,
+        "arrun_note": "per step: set_currents,0,0,0 then arrun2 (5 pts @ 10 Hz, ADPD pulse LEDs dark, actinic driven at the LED setting)",
     }
 
     old = helpers.ambit_reboot(port_ambit).act_led_coeff
