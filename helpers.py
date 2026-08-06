@@ -1042,6 +1042,16 @@ def flash_ambit_firmware(firmware_dir=None, *, cache_root=None, port=None,
         # never flashes anything.
         import firmware_fetch
         _version, firmware_dir = firmware_fetch.fetch_latest(cache_root or AMBIT_FIRMWARE_CACHE)
+    else:
+        # A caller-supplied folder must satisfy the same fail-closed contract as
+        # a freshly fetched folder; direct helper use must not bypass release
+        # provenance, size, digest, path, chip, or manifest checks.
+        import firmware_fetch
+        if not firmware_fetch.is_complete(firmware_dir):
+            raise RuntimeError(
+                f"Firmware folder {firmware_dir} is not a complete verified "
+                f"AMBIT release cache entry"
+            )
     logger.info("Using firmware folder: %s", firmware_dir)
 
     if port is None:

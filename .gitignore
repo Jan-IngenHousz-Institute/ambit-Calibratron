@@ -3,7 +3,7 @@ ambit_calibration_1_certs/
 test.ipynb
 calibrations/
 
-# Ambit firmware downloaded from the ambit-iot GitHub releases (firmware_fetch.py).
+# Ambit firmware downloaded from the public AMBIT GitHub releases (firmware_fetch.py).
 # Never commit firmware images: the release is the source of truth.
 firmware_cache/
 

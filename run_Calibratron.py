@@ -78,10 +78,12 @@ PAR_CAL_CURRENTS = [0.8, 2.4, 3.0, 4.0, 6.6, 0.0]   # A, DC source -> calibratio
 LED_CAL_SETTINGS = [10, 20, 60, 90, 150, 250, 0]          # Ambit actinic LED steps
 UPLOAD_GAINS     = True   # set False to preview the fit/plot without writing to the device
 FORCE_FLASH_FIRMWARE   = False     # True -> always re-flash, even if the device is up to date
+ALLOW_FIRMWARE_DOWNGRADE = False   # separate explicit override; normally never enable
 RENAME_AMBIT = True
 
-# The expected firmware version is no longer pinned here: it is whatever the
-# latest published public AMBIT release says (see firmware_fetch.fetch_latest).
+# Release selection is controlled by firmware_fetch: approved v1.1.3-rc1 until
+# an equal/newer immutable stable release exists. Arbitrary prereleases are not
+# selected (see firmware_fetch.fetch_latest).
 
 # Ambit firmware >= 0.1.0 answers `hello` with "NEW <name> Ready FW:<version>",
 # so the version can be read without the (slower, reboot-triggering) boot dump.
@@ -117,25 +119,29 @@ def _detect_ambit_version():
     return fw.decode(errors="replace").strip() if fw else None
 
 
-def flash_firmware(force_flash=False, current_version=None, cache_root=FIRMWARE_CACHE_DIR):
-    """Fetch the latest published Ambit firmware and flash it if needed.
+def flash_firmware(force_flash=False, current_version=None,
+                   allow_downgrade=False, cache_root=FIRMWARE_CACHE_DIR):
+    """Fetch the approved Ambit firmware and flash only when safely authorized.
 
-    The images come from the newest public AMBIT GitHub release, downloaded into
-    ``cache_root/<version>/`` by firmware_fetch (which falls back to the newest
-    complete cache entry when GitHub is unreachable). helpers.flash_ambit_firmware()
-    locates the flasher COM port, opens it for esptool, and closes it again, so
-    the port is free for discovery afterwards.
+    The images come from a policy-selected immutable public AMBIT GitHub release,
+    downloaded into ``cache_root/<version>/`` by firmware_fetch (which may fall
+    back to a verified cache entry when offline). helpers.flash_ambit_firmware()
+    locates the flasher COM port, opens it for esptool, and closes it afterwards.
 
     Flashing is decided as follows:
-      - ``force_flash=True``            -> always flash.
-      - device version != release       -> flash (also when no Ambit answers).
-      - device version == release       -> skip.
-    After a flash the device is re-read and a warning is raised if it still is
-    not running the release version.
+      - target numeric version newer than device -> upgrade.
+      - numeric versions equivalent -> skip (unless ``force_flash=True``).
+      - target older than device -> skip unless ``allow_downgrade=True``.
+      - current version unknown -> skip; recovery requires both explicit flags.
+
+    AMBIT reports only the numeric core, so device ``1.1.3`` is equivalent to
+    release ``1.1.3-rc1`` and is not repeatedly reflashed.
 
     :param force_flash: re-flash even when the device is already up to date.
     :param current_version: firmware version already read from the device; when
         None it is detected over serial.
+    :param allow_downgrade: explicit permission to install an older target;
+        separate from force-reflash so force alone cannot downgrade.
     :param cache_root: firmware cache folder to download into.
     :return: 0 on success (including a deliberately skipped flash), 1 on failure.
     """
@@ -144,28 +150,37 @@ def flash_firmware(force_flash=False, current_version=None, cache_root=FIRMWARE_
     except (urllib.error.URLError, RuntimeError, OSError) as exc:
         print(f"[flash] could not obtain the Ambit firmware: {exc}")
         return 1
-    print(f"[flash] latest published firmware: {version} ({firmware_dir})")
+    print(f"[flash] selected immutable firmware: {version} ({firmware_dir})")
 
-    # Decide whether the Ambit needs flashing, and whether to force it
-    # (a version mismatch flashes even with force_flash=False).
-    should_force = force_flash
-    if force_flash:
-        print("[flash] force_flash=True - flashing regardless of current version")
+    current = current_version or _detect_ambit_version()
+    decision = firmware_fetch.flash_decision(
+        current, version, force=force_flash, allow_downgrade=allow_downgrade,
+    )
+    if decision == "equivalent":
+        visible = firmware_fetch.device_visible_version(version)
+        print(f"[flash] Ambit firmware {current!r} is device-equivalent to "
+              f"release {version!r} ({visible}) - skipping flash")
+        return 0
+    if decision == "newer":
+        print(f"[flash] Ambit firmware {current!r} is newer than target {version!r} "
+              "- refusing automatic downgrade")
+        return 0
+    if decision == "unknown":
+        print(f"[flash] cannot prove firmware {version!r} is an upgrade because the "
+              f"current version is {current!r} - skipping. Recovery flashing with "
+              "an unknown version requires force_flash=True and "
+              "allow_downgrade=True")
+        return 0
+    if decision == "downgrade":
+        print(f"[flash] WARNING: explicit downgrade authorized: {current!r} -> {version!r}")
+    elif decision == "reflash":
+        print(f"[flash] force-reflashing device-equivalent firmware {current!r}")
     else:
-        current = current_version or _detect_ambit_version()
-        if current is None:
-            print(f"[flash] no Ambit detected - flashing firmware {version}")
-            should_force = True
-        elif current == version:
-            print(f"[flash] Ambit already runs firmware {current} - skipping flash")
-            return 0
-        else:
-            print(f"[flash] Ambit runs firmware {current!r}, latest is {version!r} - flashing")
-            should_force = True
+        print(f"[flash] upgrading Ambit firmware {current!r} -> {version!r}")
 
     try:
         flashed = helpers.flash_ambit_firmware(firmware_dir=firmware_dir,
-                                               force_flash=should_force)
+                                               force_flash=True)
     except (FileNotFoundError, RuntimeError) as exc:
         print(f"[flash] flashing failed: {exc}")
         return 1
@@ -175,11 +190,17 @@ def flash_firmware(force_flash=False, current_version=None, cache_root=FIRMWARE_
     if flashed:
         time.sleep(1.0)   # let the device finish rebooting
         running = _detect_ambit_version()
-        if running != version:
+        try:
+            verified = firmware_fetch.compare_device_versions(running, version) == 0
+        except (TypeError, ValueError):
+            verified = False
+        if not verified:
             warnings.warn(f"Firmware flashed NOT the one expected "
-                          f"(running {running!r}, expected {version!r})")
+                          f"(running {running!r}, expected device-visible "
+                          f"{firmware_fetch.device_visible_version(version)!r} "
+                          f"from release {version!r})")
         else:
-            print(f"[flash] verified firmware {running}")
+            print(f"[flash] verified device-equivalent firmware {running}")
 
     return 0
 
@@ -312,11 +333,14 @@ def calibrate_led(port_ambit, port_emit, settings=LED_CAL_SETTINGS, upload=UPLOA
 
 def main():
 
-    # 0. Flash the Ambit with the latest published firmware release
+    # 0. Optional explicit reflash. Downgrade/unknown recovery stays separately gated.
     if FORCE_FLASH_FIRMWARE:
-        print("WARNING: FORCE_FLASH_FIRMWARE is True - the device will be re-flashed even if it already runs the latest firmware")
+        print("WARNING: FORCE_FLASH_FIRMWARE is True - equivalent firmware may be re-flashed")
+        if ALLOW_FIRMWARE_DOWNGRADE:
+            print("WARNING: ALLOW_FIRMWARE_DOWNGRADE is True - an older/unknown target may be flashed")
         print("=== Flashing firmware ===")
-        rc = flash_firmware(force_flash=True)
+        rc = flash_firmware(force_flash=True,
+                            allow_downgrade=ALLOW_FIRMWARE_DOWNGRADE)
         if rc != 0:
             raise SystemExit(f"Firmware flashing failed (exit code {rc})")
         time.sleep(1.0)            # let the device finish rebooting

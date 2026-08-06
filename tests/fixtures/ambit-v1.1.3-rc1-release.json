@@ -1,0 +1,57 @@
+{
+  "id": 365792568,
+  "tag_name": "v1.1.3-rc1",
+  "name": "AMBIT v1.1.3-rc1",
+  "draft": false,
+  "prerelease": true,
+  "created_at": "2026-08-05T20:13:49Z",
+  "published_at": "2026-08-05T20:14:20Z",
+  "immutable": true,
+  "assets": [
+    {
+      "id": 503040830,
+      "name": "ambit-fw-v1.1.3-rc1.bin",
+      "state": "uploaded",
+      "size": 426912,
+      "digest": "sha256:811a5e2a955fba1eb990d05d25b5bf42ac9144eedd5f364dcb4f3414994626e4",
+      "content_type": "application/octet-stream",
+      "browser_download_url": "https://github.com/Jan-IngenHousz-Institute/ambit/releases/download/v1.1.3-rc1/ambit-fw-v1.1.3-rc1.bin"
+    },
+    {
+      "id": 503040829,
+      "name": "bootloader.bin",
+      "state": "uploaded",
+      "size": 13248,
+      "digest": "sha256:30d47ab1f344cfa69f6b2f718ffa72fc7baea6db047eaabefea162db29e6821c",
+      "content_type": "application/octet-stream",
+      "browser_download_url": "https://github.com/Jan-IngenHousz-Institute/ambit/releases/download/v1.1.3-rc1/bootloader.bin"
+    },
+    {
+      "id": 503040832,
+      "name": "boot_app0.bin",
+      "state": "uploaded",
+      "size": 8192,
+      "digest": "sha256:f94c5d786a7a8fab06ac5d10e33bf37711a6697636dc037559ea19cc410a17f0",
+      "content_type": "application/octet-stream",
+      "browser_download_url": "https://github.com/Jan-IngenHousz-Institute/ambit/releases/download/v1.1.3-rc1/boot_app0.bin"
+    },
+    {
+      "id": 503040831,
+      "name": "manifest.json",
+      "state": "uploaded",
+      "size": 849,
+      "digest": "sha256:bc6ecd522c768e97d770cb2c552761de33f7adddfe78dd42274377452849e7df",
+      "content_type": "application/json",
+      "browser_download_url": "https://github.com/Jan-IngenHousz-Institute/ambit/releases/download/v1.1.3-rc1/manifest.json"
+    },
+    {
+      "id": 503040833,
+      "name": "partitions.bin",
+      "state": "uploaded",
+      "size": 3072,
+      "digest": "sha256:148b959cbff1c38aa8e1d5c0ba9d612c54997b945e56a63f41223eef650653a1",
+      "content_type": "application/octet-stream",
+      "browser_download_url": "https://github.com/Jan-IngenHousz-Institute/ambit/releases/download/v1.1.3-rc1/partitions.bin"
+    }
+  ]
+}
