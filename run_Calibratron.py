@@ -77,7 +77,7 @@ PAR_CAL_CURRENTS = [0.8, 2.4, 3.0, 4.0, 6.6, 0.0]   # A, DC source -> calibratio
 # PAR_CAL_CURRENTS = [0.2, 0.4, 0.8, 1.0, 1.6, 0.0]   # A, DC source -> calibration lamp
 LED_CAL_SETTINGS = [10, 20, 60, 90, 150, 250, 0]          # Ambit actinic LED steps
 UPLOAD_GAINS     = True   # set False to preview the fit/plot without writing to the device
-FORCE_FLASH_FIRMWARE   = False     # True -> always re-flash, even if the device is up to date
+FORCE_FLASH_FIRMWARE   = False     # True -> reflash or recover an unresponsive device
 ALLOW_FIRMWARE_DOWNGRADE = False   # separate explicit override; normally never enable
 RENAME_AMBIT = True
 
@@ -87,7 +87,9 @@ RENAME_AMBIT = True
 
 # Ambit firmware >= 0.1.0 answers `hello` with "NEW <name> Ready FW:<version>",
 # so the version can be read without the (slower, reboot-triggering) boot dump.
-_HELLO_FW_RE = re.compile(r"FW:([0-9][^\s]+)")
+_HELLO_FW_RE = re.compile(
+    r"FW:\s*([0-9]+(?:\.[0-9]+){2}(?:-[0-9A-Za-z][0-9A-Za-z.-]*)?)"
+)
 
 
 def _detect_ambit_version():
@@ -106,7 +108,7 @@ def _detect_ambit_version():
         return None
 
     try:
-        reply = helpers._ambit_query(port, helpers.AmbitProto.HELLO)
+        reply = helpers._ambit_query(port, helpers.AmbitProto.HELLO, timeout=2.0)
     except Exception as exc:                      # serial hiccup: try the boot dump
         print(f"[flash] could not read the hello reply on {port}: {exc}")
         reply = ""
@@ -132,7 +134,7 @@ def flash_firmware(force_flash=False, current_version=None,
       - target numeric version newer than device -> upgrade.
       - numeric versions equivalent -> skip (unless ``force_flash=True``).
       - target older than device -> skip unless ``allow_downgrade=True``.
-      - current version unknown -> skip; recovery requires both explicit flags.
+      - current version unknown -> skip normally; ``force_flash=True`` recovers.
 
     AMBIT reports only the numeric core, so device ``1.1.3`` is equivalent to
     release ``1.1.3-rc1`` and is not repeatedly reflashed.
@@ -167,12 +169,14 @@ def flash_firmware(force_flash=False, current_version=None,
         return 0
     if decision == "unknown":
         print(f"[flash] cannot prove firmware {version!r} is an upgrade because the "
-              f"current version is {current!r} - skipping. Recovery flashing with "
-              "an unknown version requires force_flash=True and "
-              "allow_downgrade=True")
+              f"current version is {current!r} - skipping. Recovery flashing "
+              "requires force_flash=True")
         return 0
     if decision == "downgrade":
         print(f"[flash] WARNING: explicit downgrade authorized: {current!r} -> {version!r}")
+    elif decision == "recovery":
+        print(f"[flash] WARNING: forced recovery authorized with unknown current "
+              f"version; flashing {version!r}")
     elif decision == "reflash":
         print(f"[flash] force-reflashing device-equivalent firmware {current!r}")
     else:
@@ -333,11 +337,11 @@ def calibrate_led(port_ambit, port_emit, settings=LED_CAL_SETTINGS, upload=UPLOA
 
 def main():
 
-    # 0. Optional explicit reflash. Downgrade/unknown recovery stays separately gated.
+    # 0. Optional explicit reflash/recovery. Known downgrade stays separately gated.
     if FORCE_FLASH_FIRMWARE:
-        print("WARNING: FORCE_FLASH_FIRMWARE is True - equivalent firmware may be re-flashed")
+        print("WARNING: FORCE_FLASH_FIRMWARE is True - equivalent firmware may be re-flashed or an unresponsive device recovered")
         if ALLOW_FIRMWARE_DOWNGRADE:
-            print("WARNING: ALLOW_FIRMWARE_DOWNGRADE is True - an older/unknown target may be flashed")
+            print("WARNING: ALLOW_FIRMWARE_DOWNGRADE is True - an older known target may be flashed")
         print("=== Flashing firmware ===")
         rc = flash_firmware(force_flash=True,
                             allow_downgrade=ALLOW_FIRMWARE_DOWNGRADE)

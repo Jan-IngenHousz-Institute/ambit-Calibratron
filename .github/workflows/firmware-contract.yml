@@ -2,7 +2,7 @@ name: Firmware contract
 
 on:
   push:
-    branches: [main, feat/fetch-firmware-from-releases]
+    branches: [main]
   pull_request:
 
 permissions:

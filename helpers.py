@@ -235,9 +235,9 @@ def _command(port, cmd):
         ser.write(cmd.encode())
 
 
-def _ambit_query(port, cmd, decode="unicode_escape"):
+def _ambit_query(port, cmd, decode="unicode_escape", timeout=2.0):
     """Open, flush, readiness handshake, write, readline. For Ambit reads."""
-    with serial.Serial(port, baudrate=BAUDRATE) as ser:
+    with serial.Serial(port, baudrate=BAUDRATE, timeout=timeout) as ser:
         ser.flush()
         _wait_for_device_ready(ser)
         ser.write(cmd.encode())
@@ -992,6 +992,14 @@ def flash_ambit(port, firmware_dir):
     :raises FileNotFoundError: if the manifest or one of its images is missing
     :raises RuntimeError: if esptool exits non-zero
     """
+    # This is the lowest-level public flash entry point. Verify here so direct
+    # callers cannot bypass public/immutable provenance and byte checks.
+    import firmware_fetch
+    if not firmware_fetch.is_complete(firmware_dir):
+        raise RuntimeError(
+            f"Firmware folder {firmware_dir} is not a complete verified "
+            f"AMBIT release cache entry"
+        )
     layout = read_flash_layout(firmware_dir)
 
     cmd = [
@@ -1042,16 +1050,6 @@ def flash_ambit_firmware(firmware_dir=None, *, cache_root=None, port=None,
         # never flashes anything.
         import firmware_fetch
         _version, firmware_dir = firmware_fetch.fetch_latest(cache_root or AMBIT_FIRMWARE_CACHE)
-    else:
-        # A caller-supplied folder must satisfy the same fail-closed contract as
-        # a freshly fetched folder; direct helper use must not bypass release
-        # provenance, size, digest, path, chip, or manifest checks.
-        import firmware_fetch
-        if not firmware_fetch.is_complete(firmware_dir):
-            raise RuntimeError(
-                f"Firmware folder {firmware_dir} is not a complete verified "
-                f"AMBIT release cache entry"
-            )
     logger.info("Using firmware folder: %s", firmware_dir)
 
     if port is None:

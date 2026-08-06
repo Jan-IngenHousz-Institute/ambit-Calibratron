@@ -27,7 +27,8 @@ Design notes (all of these are field-bench requirements):
   - the explicitly approved prerelease is ``v1.1.3-rc1``. A newer immutable
     stable release becomes the default automatically; no other prerelease is
     eligible without a code-reviewed policy update.
-  - when GitHub is unreachable we fall back to the newest complete cache entry.
+  - when GitHub is unreachable or its newest release is ineligible, we fall
+    back to the newest complete cache entry.
     The caller still compares its numeric device-visible version and never
     flashes an equal or older target in the normal flow.
   - any missing/malformed digest, size disagreement, unsafe path, wrong chip,
@@ -36,6 +37,7 @@ Design notes (all of these are field-bench requirements):
 """
 
 import hashlib
+import http.client
 import json
 import logging
 import os
@@ -134,7 +136,10 @@ def _request(url, accept):
         "X-GitHub-Api-Version": "2022-11-28",
     }
     token = _auth_token()
-    if token:
+    # Release assets are public browser URLs which redirect to GitHub's CDN.
+    # Never put a token on them: urllib preserves Authorization on redirects.
+    # Authentication is useful only on the GitHub API host for rate limits.
+    if token and urllib.parse.urlsplit(url).hostname == "api.github.com":
         headers["Authorization"] = f"Bearer {token}"
     return urllib.request.Request(url, headers=headers)
 
@@ -200,15 +205,16 @@ def compare_device_versions(current, target):
 def flash_decision(current, target, *, force=False, allow_downgrade=False):
     """Return the safe flashing action for a current and target version.
 
-    Actions are ``upgrade``, ``reflash``, ``downgrade``, ``equivalent``,
-    ``newer``, or ``unknown``. Normal flow authorizes only ``upgrade``. Force
-    permits an equivalent reflash, while a newer or unknown current identity
-    still requires the separate explicit downgrade override.
+    Actions are ``upgrade``, ``reflash``, ``recovery``, ``downgrade``,
+    ``equivalent``, ``newer``, or ``unknown``. Normal flow authorizes only
+    ``upgrade``. Force permits equivalent reflash or recovery when the current
+    identity is unknown. A known newer version still requires the separate
+    explicit downgrade override.
     """
     try:
         relation = compare_device_versions(current, target)
     except (TypeError, ValueError):
-        return "downgrade" if force and allow_downgrade else "unknown"
+        return "recovery" if force else "unknown"
     if relation < 0:
         return "upgrade"
     if relation == 0:
@@ -296,7 +302,8 @@ def validate_release(release):
     """Validate immutable published release metadata and canonical assets.
 
     :return: ``(tag, assets_by_name)`` where each asset retains its REST size,
-        digest, and canonical browser download URL.
+        digest, and canonical browser download URL. Unrelated release assets
+        such as SBOMs or debug maps are deliberately ignored.
     """
     if not isinstance(release, dict):
         raise ValueError("release metadata is not an object")
@@ -316,26 +323,36 @@ def validate_release(release):
     if release["prerelease"] != (match.group("pre") is not None):
         raise ValueError(f"release {tag} prerelease state disagrees with its tag")
 
-    assets = {}
-    raw_assets = release.get("assets")
-    if not isinstance(raw_assets, list) or not raw_assets:
+    raw_assets = {}
+    release_assets = release.get("assets")
+    if not isinstance(release_assets, list) or not release_assets:
         raise ValueError(f"release {tag} has no assets")
-    for asset in raw_assets:
+    for asset in release_assets:
         if not isinstance(asset, dict):
             raise ValueError(f"release {tag} has malformed asset metadata")
         name = _safe_component(asset.get("name"), "asset name")
-        if name in assets:
+        if name in raw_assets:
             raise ValueError(f"release {tag} contains duplicate asset {name!r}")
+        raw_assets[name] = asset
+
+    version = tag[1:] if tag.startswith("v") else tag
+    required_names = {
+        MANIFEST_NAME,
+        "bootloader.bin",
+        "partitions.bin",
+        "boot_app0.bin",
+        f"ambit-fw-v{version}.bin",
+    }
+    assets = {}
+    for name in required_names:
+        asset = raw_assets.get(name)
+        if asset is None:
+            raise ValueError(f"release {tag} does not publish required asset {name!r}")
         if (isinstance(asset.get("id"), bool)
                 or not isinstance(asset.get("id"), int) or asset["id"] <= 0):
             raise ValueError(f"release asset {name!r} has no numeric REST id")
         if asset.get("state") != "uploaded":
             raise ValueError(f"release asset {name!r} is not fully uploaded")
-        expected_type = "application/json" if name == MANIFEST_NAME else "application/octet-stream"
-        if asset.get("content_type") != expected_type:
-            raise ValueError(
-                f"release asset {name!r} content type must be {expected_type!r}"
-            )
         size = _positive_size(asset.get("size"), f"REST size for {name}")
         digest = str(asset.get("digest") or "")
         if not digest.startswith("sha256:"):
@@ -366,14 +383,25 @@ def select_release(releases):
         if not isinstance(release, dict):
             continue
         tag = str(release.get("tag_name") or "").strip()
-        if tag == APPROVED_PRERELEASE_TAG:
+        is_approved = tag == APPROVED_PRERELEASE_TAG
+        try:
+            is_stable = (
+                release.get("prerelease") is False
+                and numeric_version(tag) >= approved_core
+            )
+        except ValueError:
+            is_stable = False
+        if not is_approved and not is_stable:
+            continue
+        try:
+            validate_release(release)
+        except ValueError as exc:
+            logger.warning("ignoring ineligible release %s: %s", tag or "<untagged>", exc)
+            continue
+        if is_approved:
             approved.append(release)
-        if release.get("prerelease") is False:
-            try:
-                if numeric_version(tag) >= approved_core:
-                    stable.append(release)
-            except ValueError:
-                continue
+        if is_stable:
+            stable.append(release)
 
     if stable:
         selected = max(stable, key=lambda item: version_key(item.get("tag_name")))
@@ -389,7 +417,6 @@ def select_release(releases):
             f"{APPROVED_PRERELEASE_TAG} is absent"
         )
 
-    validate_release(selected)
     return selected
 
 
@@ -455,13 +482,19 @@ def manifest_entries(manifest, *, tag=None, assets=None):
     app_name = f"ambit-fw-v{version}.bin"
     if not isinstance(ota, dict) or ota.get("file") != app_name:
         raise ValueError(f"manifest OTA asset must be {app_name!r}")
-    if assets is not None and set(assets) != seen_names | {MANIFEST_NAME}:
-        raise ValueError("release asset set does not exactly match the canonical manifest contract")
+    if assets is not None:
+        missing = (seen_names | {MANIFEST_NAME}) - set(assets)
+        if missing:
+            raise ValueError(f"release is missing canonical assets: {sorted(missing)}")
     return out
 
 
 def is_complete(version_dir):
-    """Return whether a cache entry passes the full retained release contract."""
+    """Return whether a cache entry passes the retained integrity contract.
+
+    This is deliberately independent of today's selection policy: a previously
+    proven immutable cache remains verifiable after the default tag changes.
+    """
     version_dir = Path(version_dir)
     manifest_path = version_dir / MANIFEST_NAME
     metadata = read_release_metadata(version_dir)
@@ -473,9 +506,6 @@ def is_complete(version_dir):
         validate_public_repository(metadata.get("repository"))
         release = metadata.get("release")
         tag, assets = validate_release(release)
-        selected = select_release([release])
-        if selected is not release:
-            raise ValueError("cached release does not satisfy release policy")
         manifest_asset = assets.get(MANIFEST_NAME)
         if manifest_asset is None:
             raise ValueError(f"release publishes no {MANIFEST_NAME}")
@@ -651,7 +681,8 @@ def fetch_latest(cache_root):
     Proves the source repository public, selects a newer immutable stable release
     when one exists or the explicitly approved prerelease otherwise, and checks
     every byte against both the manifest and REST metadata. If GitHub cannot be
-    reached, the newest fully proven local cache entry is used with a warning.
+    reached or the newest online metadata is ineligible, the newest fully proven
+    local cache entry is used with a warning.
 
     :param cache_root: the ``firmware_cache`` folder (created on demand)
     :return: (version, Path) - the version string and the folder holding the
@@ -663,9 +694,10 @@ def fetch_latest(cache_root):
     cache_root = Path(cache_root)
     try:
         return _download_release(cache_root)
-    except urllib.error.URLError as exc:
-        # HTTPError is a URLError; a 404 here is the "repo has no releases yet"
-        # case, which is expected until the firmware release pipeline runs once.
+    except (OSError, http.client.HTTPException, RuntimeError) as exc:
+        # A proven cache is safe when the network is unavailable or the online
+        # release is ineligible/malformed. The version comparison at the caller
+        # still decides whether that cached target may be flashed.
         reason = _describe_url_error(exc)
         fallback = newest_cached(cache_root)
         if fallback is None:
@@ -681,7 +713,8 @@ def fetch_latest(cache_root):
             ) from exc
         version, version_dir = fallback
         logger.warning(
-            "WARNING: could not reach %s (%s) - falling back to the newest cached "
+            "WARNING: could not use online firmware from %s (%s) - falling back "
+            "to the newest cached "
             "firmware %s in %s. It may not be the latest release.",
             FIRMWARE_REPO, reason, version, version_dir,
         )

@@ -31,7 +31,7 @@ Before accepting a release it proves that:
 
 - the exact source repository is public and active;
 - the release is published, non-draft, and immutable;
-- every release asset is fully uploaded and uses the canonical repository/tag
+- every required release asset is fully uploaded and uses the canonical repository/tag
   download URL;
 - the manifest is for `esp32c3`, has a safe semantic version and safe filenames,
   and describes the four canonical flash regions;
@@ -68,10 +68,13 @@ firmware_cache/<version>/
 without that proof, a required digest or size, or any matching asset is rejected.
 Existing files are re-hashed on every cache eligibility check.
 
-If GitHub is unreachable, the newest complete proven cache is returned with a
-warning. That does not authorize a flash: the runner compares numeric versions
-and upgrades only when the target is newer. An equal target is skipped, and an
-older offline target never downgrades a newer device automatically.
+If GitHub is unreachable or its newest metadata does not satisfy the contract,
+the newest complete proven cache is returned with a warning. Cache integrity is
+independent of the current selection policy, so a previously verified immutable
+release remains usable offline. That does not authorize a flash: the runner
+compares numeric versions and upgrades only when the target is newer. An equal
+target is skipped, and an older offline target never downgrades a newer device
+automatically.
 
 To pre-populate a cache without connecting or modifying hardware:
 
@@ -89,13 +92,14 @@ Normal `run_Calibratron.py` operation is strictly upgrade-only:
 - older device → flash the newer verified target;
 - equivalent numeric version → skip;
 - newer device → skip;
-- unknown/unparseable device version → skip.
+- unknown/unparseable device version → skip normally; force enables recovery.
 
-`FORCE_FLASH_FIRMWARE = True` permits a same-version reflash, but does **not**
-permit a downgrade. A downgrade or recovery flash with unknown device identity
-requires the separate `ALLOW_FIRMWARE_DOWNGRADE = True` switch as well. Enabling
-both is a deliberate service operation: confirm the selected target printed by
-the runner and preserve device/calibration data first.
+`FORCE_FLASH_FIRMWARE = True` permits a same-version reflash and recovery of a
+blank/unresponsive device whose version cannot be read, but does **not** permit
+a known downgrade. A target older than a known device requires the separate
+`ALLOW_FIRMWARE_DOWNGRADE = True` switch as well. Downgrade is a deliberate
+service operation: confirm the selected target printed by the runner and
+preserve device/calibration data first.
 
 Do not disconnect USB power during an esptool write. The runner never executes a
 flash merely by importing a module or pre-populating the cache; flashing occurs
@@ -156,4 +160,4 @@ Anonymous GitHub REST inspection on 2026-08-06 showed public repository
 - **No or multiple flashing ports:** connect exactly one AMBIT CH343 bridge and
   retry; the tool refuses to guess.
 - **Firmware version unknown:** normal flow fails closed. Inspect the serial boot
-  log and repair the connection before considering the two-switch recovery path.
+  log and connection; use `FORCE_FLASH_FIRMWARE` only for deliberate recovery.

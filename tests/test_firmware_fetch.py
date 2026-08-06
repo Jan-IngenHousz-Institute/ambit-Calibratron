@@ -3,13 +3,16 @@
 import ast
 import copy
 import hashlib
+import http.client
 import json
+import os
 import shutil
 import sys
 import tempfile
 import unittest
 import urllib.error
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -142,6 +145,12 @@ class TestProductionContractFixtures(unittest.TestCase):
         ))
         self.assertIs(approved, firmware_fetch.select_release([approved, old_stable]))
 
+    def test_ineligible_newest_stable_is_skipped(self):
+        _repo, approved, *_ = _make_contract("1.1.3-rc1")
+        _repo, mutable, *_ = _make_contract("1.1.4")
+        mutable["immutable"] = False
+        self.assertIs(approved, firmware_fetch.select_release([approved, mutable]))
+
     def test_unapproved_prerelease_is_never_selected(self):
         _repo, other, *_ = _make_contract("1.1.4-rc1")
         with self.assertRaisesRegex(ValueError, "approved prerelease"):
@@ -183,6 +192,16 @@ class TestReleaseAndManifestValidation(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "non-canonical"):
             firmware_fetch.validate_release(release)
 
+    def test_unrelated_extra_release_assets_are_ignored(self):
+        release = copy.deepcopy(self.release)
+        release["assets"].append({
+            "name": "sbom.json",
+            "content_type": "application/spdx+json",
+        })
+        tag, assets = firmware_fetch.validate_release(release)
+        self.assertEqual("v1.1.3-rc1", tag)
+        self.assertNotIn("sbom.json", assets)
+
     def test_manifest_rejects_missing_sha_size_wrong_chip_and_unsafe_path(self):
         _tag, assets = firmware_fetch.validate_release(self.release)
         mutations = (
@@ -223,6 +242,10 @@ class TestCacheCompleteness(_TempCache):
     def test_cache_without_release_provenance_fails_closed(self):
         path = _write_cache_entry(self.cache_root, omit_provenance=True)
         self.assertFalse(firmware_fetch.is_complete(path))
+
+    def test_integrity_is_independent_of_current_selection_policy(self):
+        path = _write_cache_entry(self.cache_root, "1.1.2")
+        self.assertTrue(firmware_fetch.is_complete(path))
 
     def test_tampered_manifest_or_image_fails_closed(self):
         for name in (firmware_fetch.MANIFEST_NAME, "bootloader.bin"):
@@ -298,6 +321,22 @@ class TestFetchLatest(_TempCache):
         with self.assertRaisesRegex(RuntimeError, "No usable firmware"):
             firmware_fetch.fetch_latest(self.cache_root)
 
+    def test_network_read_and_online_contract_failures_use_proven_cache(self):
+        path = _write_cache_entry(self.cache_root)
+        failures = (
+            TimeoutError("read timed out"),
+            ConnectionResetError("reset during read"),
+            http.client.IncompleteRead(b"partial", 100),
+            RuntimeError("online release failed validation"),
+        )
+        for failure in failures:
+            with self.subTest(failure=type(failure).__name__), mock.patch.object(
+                firmware_fetch, "_http_get", side_effect=failure,
+            ):
+                self.assertEqual(
+                    ("1.1.3-rc1", path), firmware_fetch.fetch_latest(self.cache_root)
+                )
+
     def test_http_404_description_is_clear(self):
         error = urllib.error.HTTPError("https://example.invalid", 404, "Not Found", {}, None)
         try:
@@ -322,6 +361,18 @@ class TestFetchLatest(_TempCache):
             calls,
         )
 
+    def test_token_is_sent_only_to_api_host_not_public_assets(self):
+        asset_url = firmware_fetch._canonical_asset_url(
+            "v1.1.3-rc1", "manifest.json"
+        )
+        with mock.patch.dict(os.environ, {"GITHUB_TOKEN": "test-secret"}):
+            api_request = firmware_fetch._request(
+                firmware_fetch.REPOSITORY_URL, "application/vnd.github+json"
+            )
+            asset_request = firmware_fetch._request(asset_url, "application/octet-stream")
+        self.assertEqual("Bearer test-secret", api_request.get_header("Authorization"))
+        self.assertIsNone(asset_request.get_header("Authorization"))
+
 
 class TestDeviceVersionPolicy(unittest.TestCase):
     def test_prerelease_is_device_equivalent_to_numeric_core(self):
@@ -344,10 +395,10 @@ class TestDeviceVersionPolicy(unittest.TestCase):
         self.assertEqual("downgrade", firmware_fetch.flash_decision(
             "1.1.4", "1.1.3-rc1", allow_downgrade=True
         ))
-        self.assertEqual("unknown", firmware_fetch.flash_decision(
+        self.assertEqual("recovery", firmware_fetch.flash_decision(
             None, "1.1.3-rc1", force=True
         ))
-        self.assertEqual("downgrade", firmware_fetch.flash_decision(
+        self.assertEqual("recovery", firmware_fetch.flash_decision(
             None, "1.1.3-rc1", force=True, allow_downgrade=True
         ))
 
@@ -369,9 +420,22 @@ class TestMergedMainRegression(unittest.TestCase):
         runner_attributes = {
             node.attr for node in ast.walk(runner_tree) if isinstance(node, ast.Attribute)
         }
+        helper_defs = {
+            node.name: node for node in ast.walk(helpers_tree)
+            if isinstance(node, ast.FunctionDef)
+        }
         self.assertTrue({"get_spec_raw_MP", "record_arrun_AMB"} <= helper_functions)
         self.assertTrue(any("ambit_spec" in value for value in runner_constants))
         self.assertIn("flash_decision", runner_attributes)
+        self.assertTrue(any(
+            isinstance(node, ast.Attribute) and node.attr == "is_complete"
+            for node in ast.walk(helper_defs["flash_ambit"])
+        ))
+        self.assertTrue(any(
+            isinstance(node, ast.keyword) and node.arg == "timeout"
+            for node in ast.walk(helper_defs["_ambit_query"])
+        ))
+        self.assertTrue(any("FW:\\s*" in value for value in runner_constants))
         self.assertTrue(any("leaf" in value for value in ast.get_docstring(helpers_tree).splitlines())
                         or "leaf" in (root / "helpers.py").read_text(encoding="utf-8"))
 
