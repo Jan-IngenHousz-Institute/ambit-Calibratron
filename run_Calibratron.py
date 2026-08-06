@@ -61,6 +61,7 @@ _ensure_requirements()   # install missing deps before the third-party imports b
 import numpy as np
 import helpers; importlib.reload(helpers)
 import firmware_fetch; importlib.reload(firmware_fetch)
+import calibration_quality; importlib.reload(calibration_quality)
 
 # ---- paths / tunables -----------------------------------------------------
 # Anchor to the directory that contains helpers.py (== this script's folder).
@@ -80,6 +81,7 @@ UPLOAD_GAINS     = True   # set False to preview the fit/plot without writing to
 FORCE_FLASH_FIRMWARE   = False     # True -> reflash or recover an unresponsive device
 ALLOW_FIRMWARE_DOWNGRADE = False   # separate explicit override; normally never enable
 RENAME_AMBIT = True
+CALIBRATE_ADPD_BASELINE = True
 
 # Release selection is controlled by firmware_fetch: approved v1.1.3-rc1 until
 # an equal/newer immutable stable release exists. Arbitrary prereleases are not
@@ -229,6 +231,86 @@ def save_payload(payload, mac=None, directory=CALIBRATIONS_DIR):
     return path
 
 
+def _write_gain_with_readback(port, *, target, previous, setter, info_field, label):
+    """Write a gain, verify it after reboot, and restore the old value on failure."""
+    wire_target = round(float(target), 4)
+    setter(port, wire_target)
+    observed = float(getattr(helpers.ambit_reboot(port), info_field))
+    if np.isclose(observed, wire_target, rtol=1e-4, atol=5e-5):
+        print(f"[{label}] verified persisted gain: {previous:.4f} -> {observed:.4f}")
+        return observed
+
+    restore_error = None
+    try:
+        setter(port, previous)
+        restored = float(getattr(helpers.ambit_reboot(port), info_field))
+        if not np.isclose(restored, previous, rtol=1e-4, atol=5e-5):
+            restore_error = f"restore readback was {restored:.6g}, expected {previous:.6g}"
+    except Exception as exc:  # preserve the original verification context
+        restore_error = str(exc)
+    detail = f"; previous value restoration failed: {restore_error}" if restore_error else "; previous value restored"
+    raise RuntimeError(
+        f"{label} calibration write was not verified (read {observed:.6g}, "
+        f"expected {wire_target:.6g}){detail}"
+    )
+
+
+def calibrate_adpd_baseline(port_ambit, previous, *, upload=UPLOAD_GAINS, input_fn=input):
+    """Measure a dark baseline and atomically persist all six channels after QC."""
+    confirmation = input_fn(
+        "Install the dark fixture, block ambient light, then type DARK to measure "
+        "the six-channel ADPD baseline (anything else skips): "
+    ).strip()
+    if confirmation != "DARK":
+        print("[ADPD baseline] skipped; no calibration value was changed")
+        return {"status": "skipped", "reason": "dark fixture not confirmed"}
+
+    measured = helpers.measure_adpd_baseline(port_ambit)
+    reasons = []
+    if len(previous) != 6 or any(
+        isinstance(value, bool) or not isinstance(value, int) or value < 0 or value > 0xFFFFFF
+        for value in previous
+    ):
+        reasons.append("existing six-channel baseline could not be read; rollback is not safe")
+    if len(measured) != 6 or any(value < 0 or value > 0xFFFFFF for value in measured):
+        reasons.append("baseline must contain six unsigned 24-bit values")
+    if measured and measured[0] > 400:
+        reasons.append("s_630 dark baseline exceeds the firmware safety limit of 400")
+    result = {
+        "status": "passed" if not reasons else "rejected",
+        "measured": measured,
+        "previous": list(previous),
+        "quality": {"passed": not reasons, "reasons": reasons, "s_630_max": 400},
+        "uploaded": False,
+    }
+    if reasons:
+        print("[ADPD baseline] rejected: " + "; ".join(reasons))
+        return result
+    if not upload:
+        print(f"[ADPD baseline] preview only: {measured}")
+        return result
+
+    helpers.set_adpd_baseline(port_ambit, measured)
+    observed = list(helpers.ambit_reboot(port_ambit).adpd_calibration)
+    if observed != measured:
+        restore_error = None
+        try:
+            helpers.set_adpd_baseline(port_ambit, list(previous))
+            restored = list(helpers.ambit_reboot(port_ambit).adpd_calibration)
+            if restored != list(previous):
+                restore_error = f"restore readback was {restored!r}"
+        except Exception as exc:
+            restore_error = str(exc)
+        detail = f"; previous baseline restoration failed: {restore_error}" if restore_error else "; previous baseline restored"
+        raise RuntimeError(
+            f"ADPD baseline write was not verified (read {observed!r}, expected {measured!r}){detail}"
+        )
+    result["uploaded"] = True
+    result["readback"] = observed
+    print(f"[ADPD baseline] saved and verified: {observed}")
+    return result
+
+
 def calibrate_par_sensor(port_ambit, port_ref, port_dc, currents=PAR_CAL_CURRENTS, upload=UPLOAD_GAINS):
     """Sweep the calibration lamp, fit Ambit-raw PAR vs MiniPAR reference, show
     the plot, and (optionally) upload the slope as the Ambit PAR gain.
@@ -251,14 +333,18 @@ def calibrate_par_sensor(port_ambit, port_ref, port_dc, currents=PAR_CAL_CURRENT
     helpers.set_current(port=port_dc, current=0.0)
 
     x, y = np.array(ambit_raw), np.array(ref_par)
-    coeffs = np.polyfit(x, y, 1)
-    r2 = helpers.r_squared(y, np.polyval(coeffs, x))
-    slope = float(coeffs[0])
+    quality = calibration_quality.assess_origin_fit(
+        x, y, currents, coefficient_min=0.05, coefficient_max=100.0
+    )
+    slope = float(quality["coefficient"])
+    r2 = float(quality["r2"])
+    coeffs = np.array([slope, 0.0])
 
     cal = {
         "x": x.tolist(), "x_label": "Ambit PAR (raw)",
         "y": y.tolist(), "y_label": "MiniPAR PAR (reference)",
         "slope": slope, "r2": float(r2),
+        "quality": quality,
         "currents_A": list(currents),
         "ambit_spec": ambit_spec,
         "ambit_spec_channels": ["F1_415", "F2_445", "F3_480", "F4_515", "F5_555",
@@ -276,10 +362,14 @@ def calibrate_par_sensor(port_ambit, port_ref, port_dc, currents=PAR_CAL_CURRENT
     helpers.plot_data_and_fit(x, y, coeffs, r2,
                               xlabel="Ambit PAR (raw)", ylabel="MiniPAR PAR (reference)")
 
+    if not quality["passed"]:
+        print("[PAR cal] REJECTED; existing gain kept: " + "; ".join(quality["reasons"]))
+        return cal
     if upload:
-        helpers.set_par_gain(port_ambit, slope)
-        new = helpers.ambit_reboot(port_ambit).light_slope
-        print(f"[PAR cal] uploaded PAR gain: {old:.4f} -> {new:.4f}")
+        _write_gain_with_readback(
+            port_ambit, target=slope, previous=old, setter=helpers.set_par_gain,
+            info_field="light_slope", label="PAR cal"
+        )
     return cal
 
 
@@ -303,14 +393,18 @@ def calibrate_led(port_ambit, port_emit, settings=LED_CAL_SETTINGS, upload=UPLOA
         led_setting.append(s)
 
     x, y = np.array(measured), np.array(led_setting)
-    coeffs = np.polyfit(x, y, 1)
-    r2 = helpers.r_squared(y, np.polyval(coeffs, x))
-    slope = float(coeffs[0])
+    quality = calibration_quality.assess_origin_fit(
+        x, y, settings, coefficient_min=0.01, coefficient_max=1.0
+    )
+    slope = float(quality["coefficient"])
+    r2 = float(quality["r2"])
+    coeffs = np.array([slope, 0.0])
 
     cal = {
         "x": x.tolist(), "x_label": "MiniPAR PAR (over LED)",
         "y": y.tolist(), "y_label": "Ambit LED setting",
         "slope": slope, "r2": float(r2),
+        "quality": quality,
         "ref_spec": ref_spec,
         "ref_spec_channels": ["F1_415", "F2_445", "F3_480", "F4_515", "F5_555",
                               "F6_590", "F7_630", "F8_680", "CLEAR", "NIR"],
@@ -320,18 +414,18 @@ def calibrate_led(port_ambit, port_emit, settings=LED_CAL_SETTINGS, upload=UPLOA
 
     old = helpers.ambit_reboot(port_ambit).act_led_coeff
 
-    if r2 < 0.99:
-        print("[LED cal] WARNING: poor fit quality - check the plot for outliers or nonlinearity")
+    if not quality["passed"]:
+        print("[LED cal] REJECTED; existing gain kept: " + "; ".join(quality["reasons"]))
         helpers.plot_data_and_fit(x, y, coeffs, r2,
                                 xlabel="MiniPAR PAR (over LED)", ylabel="Ambit LED setting")
-        print("[LED cal] uploading old values due to poor fit quality")
         return cal
 
     print(f"[LED cal] fit slope={slope:.4f}  R^2={r2:.6f}  (current act_led_coeff={old:.4f})")
     if upload:
-        helpers.set_ambit_led_gain(port_ambit, slope)
-        new = helpers.ambit_reboot(port_ambit).act_led_coeff
-        print(f"[LED cal] uploaded LED gain: {old:.4f} -> {new:.4f}")
+        _write_gain_with_readback(
+            port_ambit, target=slope, previous=old, setter=helpers.set_ambit_led_gain,
+            info_field="act_led_coeff", label="LED cal"
+        )
     return cal
 
 
@@ -395,7 +489,17 @@ def main():
         new_name = input(f"Enter new name for Ambit (current: {current_name}): ").strip()
         helpers.set_ambit_name(port_ambit, new_name)
 
-    # 7. PAR-sensor calibration (needs the DC source + PAR-reference MiniPAR)
+    # 7. ADPD baseline (requires an explicitly confirmed dark fixture). The
+    # firmware persists the complete vector atomically; readback is mandatory.
+    baseline_cal = None
+    if CALIBRATE_ADPD_BASELINE:
+        print("\n=== ADPD dark baseline ===")
+        current_info = helpers.ambit_reboot(port_ambit)
+        baseline_cal = calibrate_adpd_baseline(
+            port_ambit, current_info.adpd_calibration
+        )
+
+    # 8. PAR-sensor calibration (needs the DC source + PAR-reference MiniPAR)
     par_cal = None
     if port_ref and port_dc:
         print("\n=== PAR sensor calibration ===")
@@ -405,7 +509,7 @@ def main():
                                            ("Kiprim DC source", port_dc)) if p is None)
         print(f"\n[skip] PAR sensor calibration - missing: {missing}")
 
-    # 8. Actinic-LED calibration (needs the Emit_LED MiniPAR)
+    # 9. Actinic-LED calibration (needs the Emit_LED MiniPAR)
     led_cal = None
     if port_emit:
         print("\n=== Actinic LED calibration ===")
@@ -413,25 +517,25 @@ def main():
     else:
         print("\n[skip] Actinic LED calibration - missing: Emit_LED MiniPAR")
 
-    # 9. Final state
+    # 10. Final state
     print("\n=== Ambit after calibration ===")
     info_postcalibration = helpers.ambit_reboot(port_ambit)
     print(info_postcalibration)
 
-    # 10. Build the calibration payload (aborts with a warning if either dump is empty)
+    # 11. Build the calibration payload (aborts with a warning if either dump is empty)
     print("\n=== Calibration payload ===")
     payload = helpers.make_calibration_payload(
         info_precalibration, info_postcalibration,
-        par_cal=par_cal, led_cal=led_cal,
+        par_cal=par_cal, led_cal=led_cal, baseline_cal=baseline_cal,
     )
     print(payload)
 
-    # 11. Save the payload to ./calibrations/<YYYY-MM-DD_HH-MM-SS>_<MAC>.json
+    # 12. Save the payload to ./calibrations/<YYYY-MM-DD_HH-MM-SS>_<MAC>.json
     print("\n=== Saving payload ===")
     save_payload(payload, mac=info_postcalibration.MAC)
     # return payload
 
-    # 12. (Optional) Publish the payload to AWS IoT Core via MQTT
+    # 13. (Optional) Publish the payload to AWS IoT Core via MQTT
     helpers.publish_payload_mqtt5(
         payload,
         topic="experiment/data_ingest/v1/993ae58e-2e87-45ef-96e1-5bbdb0916817/ambit/v1.0/ambit_calibration_1/1234556",

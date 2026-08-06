@@ -196,6 +196,8 @@ class AmbitProto:
     GET_PAR_CAL = "PAR\n"
     SET_SPEC    = "set_spec, {coeff:.4f}\n"
     SET_ACT     = "set_act, {coeff:.4f}\n"
+    MEASURE_BASELINE = "baseline,0\n"
+    SET_BASELINE = "set_baseline,{values}\n"
     SET_NAME    = "set_name,{name}\n"
     LED_RUN     = "arrun1,1,1,2,0,0,1,0,1,{led:d},1,\n, \n"
     SET_CURRENTS = "set_currents,{i620:d},{i720:d},{ir:d},\n"
@@ -471,6 +473,43 @@ def set_ambit_led_gain(port, coeff):
     :param coeff: Calibration coefficient value
     """
     _ambit_command(port, AmbitProto.SET_ACT.format(coeff=coeff))
+
+
+def measure_adpd_baseline(port, timeout=20.0):
+    """Measure, but do not persist, the six-channel ADPD dark baseline."""
+    with serial.Serial(port, baudrate=BAUDRATE, timeout=timeout) as ser:
+        ser.flush()
+        _wait_for_device_ready(ser)
+        ser.write(AmbitProto.MEASURE_BASELINE.encode())
+        for _ in range(12):
+            line = ser.readline().decode("utf-8", errors="replace").strip()
+            parts = line.split(",")
+            if len(parts) != 6:
+                continue
+            try:
+                values = [int(value) for value in parts]
+            except ValueError:
+                continue
+            if all(0 <= value <= 0xFFFFFF for value in values):
+                return values
+    raise RuntimeError("AMBIT did not return a valid six-channel ADPD baseline")
+
+
+def set_adpd_baseline(port, values, timeout=5.0):
+    """Persist one complete baseline vector and require firmware verification."""
+    if len(values) != 6 or any(
+        isinstance(value, bool) or not isinstance(value, int) or value < 0 or value > 0xFFFFFF
+        for value in values
+    ):
+        raise ValueError("ADPD baseline must contain six unsigned 24-bit integers")
+    command = AmbitProto.SET_BASELINE.format(values=",".join(str(value) for value in values))
+    with serial.Serial(port, baudrate=BAUDRATE, timeout=timeout) as ser:
+        ser.flush()
+        _wait_for_device_ready(ser)
+        ser.write(command.encode())
+        response = ser.readline().decode("utf-8", errors="replace").strip()
+    if response != "Baseline saved and verified":
+        raise RuntimeError(f"AMBIT baseline write was not verified: {response!r}")
 
 
 
@@ -749,7 +788,7 @@ def make_calibration_payload(info_precalibration=None, info_postcalibration=None
                              device_id=None, device_name=None,
                              firmware_version=None, device_firmware=None,
                              device_version="1", protocol_id="CALIBRATION",
-                             par_cal=None, led_cal=None,
+                             par_cal=None, led_cal=None, baseline_cal=None,
                              indent=2):
     """Build the JSON calibration-upload payload from the pre/post AmbitInfo dumps.
 
@@ -763,6 +802,8 @@ def make_calibration_payload(info_precalibration=None, info_postcalibration=None
         from calibrate_par_sensor(); ``None`` (-> JSON null) if it was skipped
     :param led_cal: actinic-LED calibration block, same shape, from
         calibrate_led(); ``None`` if it was skipped
+    :param baseline_cal: six-channel ADPD dark-baseline measurement, QC, and
+        readback record; ``None`` if it was skipped
     :param indent: json.dumps indent (None for a compact one-line payload)
     :return: a JSON string ready to send
     :raises ValueError: if either AmbitInfo is missing / never populated
@@ -801,6 +842,7 @@ def make_calibration_payload(info_precalibration=None, info_postcalibration=None
                         "METADATA_POSTCALIBRATION": info_postcalibration.to_dict(),
                         "PAR_SENSOR_CALIBRATION":   par_cal,
                         "LED_CALIBRATION":          led_cal,
+                        "ADPD_BASELINE_CALIBRATION": baseline_cal,
                     }
                 ],
             }
