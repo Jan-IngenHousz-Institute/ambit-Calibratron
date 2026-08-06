@@ -3,6 +3,10 @@ ambit_calibration_1_certs/
 test.ipynb
 calibrations/
 
+# Ambit firmware downloaded from the public AMBIT GitHub releases (firmware_fetch.py).
+# Never commit firmware images: the release is the source of truth.
+firmware_cache/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

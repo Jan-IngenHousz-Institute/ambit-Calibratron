@@ -9,6 +9,7 @@ This module contains utilities for:
 """
 
 import os
+import re
 import sys
 import time
 import json
@@ -18,6 +19,7 @@ import serial.tools.list_ports
 import subprocess
 import importlib.util
 import glob
+from pathlib import Path
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from matplotlib import pyplot as plt
@@ -233,9 +235,9 @@ def _command(port, cmd):
         ser.write(cmd.encode())
 
 
-def _ambit_query(port, cmd, decode="unicode_escape"):
+def _ambit_query(port, cmd, decode="unicode_escape", timeout=2.0):
     """Open, flush, readiness handshake, write, readline. For Ambit reads."""
-    with serial.Serial(port, baudrate=BAUDRATE) as ser:
+    with serial.Serial(port, baudrate=BAUDRATE, timeout=timeout) as ser:
         ser.flush()
         _wait_for_device_ready(ser)
         ser.write(cmd.encode())
@@ -816,32 +818,33 @@ def make_calibration_payload(info_precalibration=None, info_postcalibration=None
 # ============================================================================
 # Firmware Flashing (Ambit)
 # ============================================================================
-# Self-contained Ambit firmware flasher ported from the standalone
-# ``ambit_uploader.py``: it locates the compiled firmware images, resolves
-# esptool, finds the flasher serial port, and runs the flash - so the
-# calibration tooling can (re)flash an Ambit without shelling out to any
-# external uploader script.
+# Self-contained Ambit firmware flasher: it resolves esptool, reads the flash
+# layout from the firmware release manifest, finds the flasher serial port and
+# runs the flash - so the calibration tooling can (re)flash an Ambit without
+# shelling out to any external uploader script.
+#
+# The images are no longer vendored in this repo. ``firmware_fetch.py`` pulls
+# the latest public AMBIT release into ``firmware_cache/<version>/`` and the folder
+# it returns is what gets flashed. That folder always carries a ``manifest.json``
+# describing which file goes at which offset, so a layout change on the firmware
+# side (extra partition, renamed image, ...) needs no change here.
 
 # WCH CH343 USB-serial bridge used by the Ambit flasher.
 FLASHER_VID = 0x1A86
 FLASHER_PID = 0x55D4
 FLASHER_VIDPID = "1A86:55D4"
 
-# Compiled Ambit firmware images; all must live together in one folder.
-AMBIT_FIRMWARE_FILES = [
-    "ambit-1.ino.bin",
-    "ambit-1.ino.bootloader.bin",
-    "ambit-1.ino.partitions.bin",
-    "boot_app0.bin",
-]
+# Release manifest that describes the flash layout; written by the public AMBIT
+# release pipeline and downloaded alongside the images.
+AMBIT_MANIFEST_NAME = "manifest.json"
 
-# esptool flash offset -> image, for the ESP32-C3 on the Ambit.
-_AMBIT_FLASH_LAYOUT = [
-    ("0x0",     "ambit-1.ino.bootloader.bin"),
-    ("0x8000",  "ambit-1.ino.partitions.bin"),
-    ("0xe000",  "boot_app0.bin"),
-    ("0x10000", "ambit-1.ino.bin"),
-]
+# Folder this module lives in. The bundled Windows esptool.exe is looked up
+# here (recursively) - it is part of the repo, not of the firmware download.
+REPO_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Default cache root used when no firmware folder is passed in; must match the
+# one run_Calibratron.py uses so both share one download.
+AMBIT_FIRMWARE_CACHE = os.path.join(REPO_DIR, "firmware_cache")
 
 
 def find_file(start_dir, filename):
@@ -854,40 +857,79 @@ def find_file(start_dir, filename):
     return None
 
 
-def find_firmware_dir(start_dir, required_files=AMBIT_FIRMWARE_FILES):
-    """Search ``start_dir`` and its sub-folders for a folder that holds every
-    file in ``required_files``.
+def read_flash_layout(firmware_dir, manifest_name=AMBIT_MANIFEST_NAME):
+    """Read the esptool flash layout out of a firmware folder's manifest.
 
-    :param start_dir: directory tree to search
-    :param required_files: filenames that must all be present together
-    :return: absolute path of the first matching folder, or None
+    The manifest's ``flash`` array is the contract with the firmware repo::
+
+        {"flash": [{"file": "bootloader.bin", "offset": "0x0", "sha256": ...},
+                   ...]}
+
+    :param firmware_dir: folder holding ``manifest.json`` and the images
+    :param manifest_name: manifest file name (override only for tests)
+    :return: list of (offset, filename) tuples, ascending by offset
+    :raises FileNotFoundError: if the manifest or one of its images is missing
+    :raises RuntimeError: if the manifest is not usable JSON / has no layout
     """
-    required = set(required_files)
-    for root, _dirs, files in os.walk(start_dir):
-        if required.issubset(files):
-            return os.path.abspath(root)
-    return None
+    firmware_dir = Path(firmware_dir)
+    manifest_path = firmware_dir / manifest_name
+    try:
+        with open(manifest_path, encoding="utf-8") as f:
+            manifest = json.load(f)
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(
+            f"no {manifest_name} in {firmware_dir} - the firmware folder must be "
+            f"one produced by firmware_fetch.fetch_latest()"
+        ) from exc
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"{manifest_path} is not valid JSON: {exc}") from exc
+
+    entries = manifest.get("flash") if isinstance(manifest, dict) else None
+    if not entries:
+        raise RuntimeError(f"{manifest_path} lists no 'flash' entries")
+
+    layout = []
+    for entry in entries:
+        name = entry.get("file") if isinstance(entry, dict) else None
+        offset = entry.get("offset") if isinstance(entry, dict) else None
+        if not name or offset is None:
+            raise RuntimeError(f"{manifest_path}: 'flash' entry missing file/offset: {entry!r}")
+        image = firmware_dir / str(name)
+        if not image.is_file():
+            raise FileNotFoundError(f"{manifest_path} lists {name!r} but {image} is missing")
+        layout.append((str(offset), str(name)))
+
+    # esptool does not care about the order, but a deterministic ascending
+    # layout makes the logged command readable and diffable across runs.
+    def _offset_value(item):
+        try:
+            return int(item[0], 0)
+        except (TypeError, ValueError):
+            return 0
+
+    layout.sort(key=_offset_value)
+    return layout
 
 
-def esptool_command(firmware_dir=None):
+def esptool_command():
     """Return the argv prefix used to invoke esptool, cross-platform.
 
-    Prefers a bundled ``esptool.exe`` on Windows (searched inside
-    ``firmware_dir`` when given); otherwise runs the installed ``esptool``
-    package via ``python -m esptool``.
+    Prefers the ``esptool.exe`` bundled in this repo on Windows (searched from
+    this module's folder downwards - the firmware cache folder holds only the
+    downloaded images, never the flasher); otherwise runs the installed
+    ``esptool`` package via ``python -m esptool``.
 
-    :param firmware_dir: optional folder to search for a bundled esptool.exe
     :raises RuntimeError: if no esptool is available
     """
-    if os.name == "nt" and firmware_dir:
-        local_exe = find_file(firmware_dir, "esptool.exe")
+    if os.name == "nt":
+        local_exe = find_file(REPO_DIR, "esptool.exe")
         if local_exe:
             return [local_exe]
     if importlib.util.find_spec("esptool") is not None:
         return [sys.executable, "-m", "esptool"]
     raise RuntimeError(
         "esptool not found - install it with `pip install esptool`, "
-        "or place esptool.exe next to the firmware images (Windows only)."
+        "or place esptool.exe in the Calibratron folder (Windows only)."
     )
 
 
@@ -940,12 +982,28 @@ def flash_ambit(port, firmware_dir):
     """Write the Ambit firmware images in ``firmware_dir`` to the device on
     ``port`` by invoking esptool.
 
+    The offsets and file names come from the folder's ``manifest.json`` (see
+    :func:`read_flash_layout`). esptool is invoked with ``cwd=firmware_dir`` and
+    bare file names, which keeps the command line short and free of the spaces
+    that Windows bench paths are full of.
+
     :param port: serial port of the Ambit flasher
-    :param firmware_dir: folder holding the AMBIT_FIRMWARE_FILES images
+    :param firmware_dir: folder holding manifest.json + the firmware images
+    :raises FileNotFoundError: if the manifest or one of its images is missing
     :raises RuntimeError: if esptool exits non-zero
     """
+    # This is the lowest-level public flash entry point. Verify here so direct
+    # callers cannot bypass public/immutable provenance and byte checks.
+    import firmware_fetch
+    if not firmware_fetch.is_complete(firmware_dir):
+        raise RuntimeError(
+            f"Firmware folder {firmware_dir} is not a complete verified "
+            f"AMBIT release cache entry"
+        )
+    layout = read_flash_layout(firmware_dir)
+
     cmd = [
-        *esptool_command(firmware_dir),
+        *esptool_command(),
         "--chip", "esp32c3",
         "--baud", "921600",
         "--port", port,
@@ -956,43 +1014,42 @@ def flash_ambit(port, firmware_dir):
         "--flash_freq", "keep",
         "--flash_size", "keep",
     ]
-    for offset, image in _AMBIT_FLASH_LAYOUT:
+    for offset, image in layout:
         cmd += [offset, image]
 
-    logger.info("Flashing %s with esptool...", port)
-    result = subprocess.run(cmd, cwd=firmware_dir)
+    logger.info("Flashing %s with esptool (%s)...", port,
+                ", ".join(f"{off}:{img}" for off, img in layout))
+    result = subprocess.run(cmd, cwd=str(firmware_dir))
     if result.returncode != 0:
         raise RuntimeError(f"esptool exited with return code {result.returncode}")
     logger.info("Flash completed.")
 
 
-def flash_ambit_firmware(firmware_dir=None, *, search_root=None, port=None,
+def flash_ambit_firmware(firmware_dir=None, *, cache_root=None, port=None,
                          force_flash=True):
-    """Locate the Ambit firmware, find the flasher port, and flash the device.
+    """Get the Ambit firmware, find the flasher port, and flash the device.
 
-    Self-contained equivalent of the standalone ``ambit_uploader.py`` script:
-    the calibration tooling can (re)flash an Ambit on its own.
-
-    :param firmware_dir: folder holding the firmware images; if None, it is
-        discovered by searching ``search_root`` (see :func:`find_firmware_dir`)
-    :param search_root: directory tree searched for the firmware when
-        ``firmware_dir`` is None (default: this module's own folder)
+    :param firmware_dir: folder holding manifest.json + the firmware images
+        (normally the ``firmware_cache/<version>/`` folder returned by
+        ``firmware_fetch.fetch_latest``); if None, the latest public AMBIT release
+        is fetched into ``cache_root`` first
+    :param cache_root: firmware cache folder used when ``firmware_dir`` is None
+        (default: ``<repo>/firmware_cache``)
     :param port: flasher serial port; if None, auto-detected (exactly one
         flasher must be connected)
     :param force_flash: when True, always flash; when False, flash only if a
         boot-time "invalid header" is detected on the device
     :return: True if the device was flashed, False if flashing was skipped
-    :raises FileNotFoundError: if the firmware images cannot be located
-    :raises RuntimeError: if zero / multiple flasher ports are found, or esptool fails
+    :raises FileNotFoundError: if the manifest / images cannot be found
+    :raises RuntimeError: if the firmware cannot be fetched, if zero / multiple
+        flasher ports are found, or if esptool fails
     """
     if firmware_dir is None:
-        root = search_root or os.path.dirname(os.path.abspath(__file__))
-        firmware_dir = find_firmware_dir(root, AMBIT_FIRMWARE_FILES)
-        if firmware_dir is None:
-            raise FileNotFoundError(
-                f"Could not find the Ambit firmware files "
-                f"({', '.join(AMBIT_FIRMWARE_FILES)}) under {root!r}"
-            )
+        # Imported lazily: only the flashing path needs it, and it must stay
+        # usable even when this module is imported from a notebook kernel that
+        # never flashes anything.
+        import firmware_fetch
+        _version, firmware_dir = firmware_fetch.fetch_latest(cache_root or AMBIT_FIRMWARE_CACHE)
     logger.info("Using firmware folder: %s", firmware_dir)
 
     if port is None:
@@ -1017,6 +1074,225 @@ def flash_ambit_firmware(firmware_dir=None, *, search_root=None, port=None,
 
     flash_ambit(port, firmware_dir)
     return True
+
+
+# ============================================================================
+# Post-flash hardware self-test (Ambit)
+# ============================================================================
+# Ported verbatim (logic and regexes) from the retired
+# ``firmware_ambit/uploader.py``, which was the only place it lived. Nothing in
+# the calibration flow calls it today; it is kept importable because it is the
+# only automated check of the Ambit's sensor stack right after a flash, and it
+# would otherwise be lost with the uploader script.
+
+# MLX90632 temperature-sensor acceptance limits.
+MIN_TEMP = -10             # deg C, lower bound for a valid reading
+MAX_TEMP = 40              # deg C, upper bound for a valid reading
+MLX_READ_TIME_LIMIT = 100  # ms, max acceptable sensor read time
+
+
+def ambit_readlines(ser, timeout=1.0, invalid_bahave=False, max_lines=1, ending_line=""):
+    """Read up to ``max_lines`` newline-terminated lines from ``ser``.
+
+    Byte-at-a-time on purpose: the ``check`` dump is tab-formatted and the
+    caller's regexes match on those exact tabs, and a byte >= 128 means the
+    device is spewing framing noise rather than text (``invalid_bahave=True``
+    aborts on that instead of poisoning the parse).
+
+    :param ser: an open serial.Serial
+    :param timeout: overall budget in seconds
+    :param invalid_bahave: stop at the first non-ASCII byte
+    :param max_lines: stop after this many lines
+    :param ending_line: stop early once a line contains this substring
+    :return: list of decoded lines (newline included)
+    """
+    lines = []
+    line = ""
+    t0 = time.perf_counter()
+    while (time.perf_counter() - t0) < timeout:
+        if ser.in_waiting > 0:
+            r = ser.read()
+            if r < bytes([128]):
+                line += r.decode(errors="replace")
+            else:
+                if invalid_bahave:
+                    break
+            if r == b"\n":
+                lines.append(line)
+                line = ""
+                if ending_line and ending_line in lines[-1]:
+                    break
+        else:
+            time.sleep(0.1)
+        if len(lines) >= max_lines:
+            break
+    return lines
+
+
+def is_increasing(values):
+    """True when each value in a sweep is larger than the one before it.
+
+    The gain / current sweeps step the photodiode amplification up, so a
+    healthy channel returns readings that climb monotonically.
+    """
+    return len(values) > 1 and all(b > a for a, b in zip(values, values[1:]))
+
+
+def ambit_self_test(port):
+    """Run the Ambit's built-in ``check`` self-test and grade every sensor.
+
+    Detects the device with ``hello``, then drives ``check`` and parses the
+    dump: ADPD chip id, AS7341 light level, MLX90632 timing + plausibility
+    (cross-checked against the ESP32 die temperature), and the four photodiode
+    gain / current sweeps.
+
+    :param port: serial port of the Ambit device
+    :return: dict of check name -> pass/fail bool
+    """
+
+    ret_dict = {"FW": False, "ADPD": False, "AS7341": False, "MLX90632": False,
+                "Temp": False, "LightPass-SunPD": False, "LightPass-LeafPD": False,
+                "LightPass-SignalPD": False, "LightPass-RefPD": False}
+
+    ambit_ready = 0
+    with serial.Serial(port, BAUDRATE) as ser:
+        trials = 50
+        logger.info("Trying to detect Ambit %d times", trials)
+        ser.write(b"\r\n")
+        ser.flush()
+        time.sleep(0.1)
+
+        for attempt in range(trials):
+            # Drop any stale/buffered output (e.g. the boot log) before each
+            # attempt, so we read the fresh reply to *this* hello instead of
+            # chewing through a backlog one line at a time over all 50 trials.
+            ser.reset_input_buffer()
+            ser.write(b"hello\r\n")
+            lines = ambit_readlines(ser, timeout=0.5, invalid_bahave=True, max_lines=1)
+            logger.info("Reading: %s; %d/%d waiting for 'NEW Name Here Ready'...",
+                        lines, attempt + 1, trials)
+            if len(lines) == 0:
+                continue
+
+            if "NEW Name Here Ready" in lines[0]:
+                logger.info("[PASS]\t\tAmbit is detected")
+                ret_dict["FW"] = True
+                ambit_ready = 1
+                break
+
+            if ambit_ready == 0:
+                logger.info("Received: %s", lines[0].strip())
+
+        if ambit_ready == 0:
+            logger.info("[FAILED]\tAmbit detection failed")
+            return ret_dict
+
+        ser.write(b"check\r\n")
+        lines = ambit_readlines(ser, timeout=5, invalid_bahave=False, max_lines=50,
+                               ending_line="Done!!")
+
+        adpd_match = re.compile(r"Checking ADPD\s+ADPD Found, chip version: (\d+)")
+        as7341_match = re.compile(r"Checking AS7341\s+Success\s+(\d+),(\d+),(\d+),(\d+),(\d+),(\d+),(\d+),(\d+)")
+        mlx_match = re.compile(r"Checking MLX90632\s+Success\s+(\d+)\s+([\d.]+)\s+([\d.]+)")
+        chip_match = re.compile(r"ESP32Temp\s+([\d.]+)")
+        sunPD_match = re.compile(r"Sun PD\t\t(\d+)\t(\d+)\t(\d+)\t(\d+)\t(\d+)\n")
+        leafPD_match = re.compile(r"Leaf PD\t\t(\d+)\t(\d+)\t(\d+)\t(\d+)\t(\d+)\n")
+        signal_match = re.compile(r"Signal\t\t(\d+)\t(\d+)\t(\d+)\t(\d+)\t(\d+)\n")
+        ref_match = re.compile(r"Ref\t\t(\d+)\t(\d+)\t(\d+)\t(\d+)\t(\d+)\n")
+
+        light_intensity = 0
+        chip_temp = -100.0
+        temp1, temp2 = 100.0, 200.0
+
+        for line in lines:
+            if adpd_match.match(line):
+                ret_dict["ADPD"] = True
+                continue
+
+            if chip_match.match(line):
+                ret = chip_match.findall(line)
+                if ret[0][0].isnumeric():
+                    chip_temp = float(ret[0])
+                continue
+
+            if as7341_match.match(line):
+                ret = as7341_match.findall(line)
+                for n in ret[0]:
+                    if n.isnumeric():
+                        light_intensity += int(n)
+                if light_intensity > 5:
+                    ret_dict["AS7341"] = True
+                    logger.info("[PASS]\t\tAS7341 Found, light intensity: %s", light_intensity)
+                else:
+                    logger.info("[FAILED]\tAS7341 Found, but light intensity too low: %s",
+                                light_intensity)
+                continue
+
+            if mlx_match.match(line):
+                ret = mlx_match.findall(line)
+                read_time = int(ret[0][0])
+                temp1 = float(ret[0][1])
+                temp2 = float(ret[0][2])
+                if read_time < MLX_READ_TIME_LIMIT and temp1 > MIN_TEMP and temp1 < MAX_TEMP and temp2 > MIN_TEMP and temp2 < MAX_TEMP:
+                    ret_dict["MLX90632"] = True
+                    logger.info("[PASS]\t\tMLX90632 Found, reading time:%s, die temp: %s, object temp: %s",
+                                read_time, temp1, temp2)
+                else:
+                    if read_time >= MLX_READ_TIME_LIMIT:
+                        logger.info("[FAILED]\tMLX90632 read time too long: %s", read_time)
+                    else:
+                        logger.info("[FAILED]\tMLX90632 Found, reading time:%s, die temp: %s, object temp: %s",
+                                    ret[0][0], ret[0][1], ret[0][2])
+                continue
+
+            if sunPD_match.match(line):
+                arr = [int(n) for n in sunPD_match.findall(line)[0]]
+                logger.info("Sun PD values: %s", arr)
+                if is_increasing(arr):
+                    logger.info("[PASS]\t\t<SUN> PD gain sweep")
+                    ret_dict["LightPass-SunPD"] = True
+                else:
+                    logger.info("[FAILED]\t<SUN> PD gain sweep not increasing!")
+                continue
+
+            if leafPD_match.match(line):
+                arr = [int(n) for n in leafPD_match.findall(line)[0]]
+                logger.info("Leaf PD values: %s", arr)
+                if is_increasing(arr):
+                    logger.info("[PASS]\t\t<Leaf> PD gain sweep")
+                    ret_dict["LightPass-LeafPD"] = True
+                else:
+                    logger.info("[FAILED]\t<Leaf> PD gain sweep not increasing!")
+                continue
+
+            if signal_match.match(line):
+                arr = [int(n) for n in signal_match.findall(line)[0]]
+                logger.info("Signal PD values: %s", arr)
+                if is_increasing(arr):
+                    logger.info("[PASS]\t\t<Signal> PD Current sweep")
+                    ret_dict["LightPass-SignalPD"] = True
+                else:
+                    logger.info("[FAILED]\t<Signal> PD Current sweep not increasing!")
+                continue
+
+            if ref_match.match(line):
+                arr = [int(n) for n in ref_match.findall(line)[0]]
+                logger.info("Ref PD values: %s", arr)
+                if is_increasing(arr):
+                    logger.info("[PASS]\t\t<Ref> PD Current sweep")
+                    ret_dict["LightPass-RefPD"] = True
+                else:
+                    logger.info("[FAILED]\t<Ref> PD Current sweep not increasing!")
+                continue
+
+    if abs(chip_temp * 2 - temp1 - temp2) > 30:
+        if ret_dict["MLX90632"]:
+            logger.info("[FAILED]\tTemperature reading mismatch, chip temp: %s, mlx temp: %s, %s",
+                        chip_temp, temp1, temp2)
+    else:
+        ret_dict["Temp"] = True
+
+    return ret_dict
 
 
 # ============================================================================
