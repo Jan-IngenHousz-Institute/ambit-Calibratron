@@ -789,6 +789,7 @@ def make_calibration_payload(info_precalibration=None, info_postcalibration=None
                              firmware_version=None, device_firmware=None,
                              device_version="1", protocol_id="CALIBRATION",
                              par_cal=None, led_cal=None, baseline_cal=None,
+                             firmware_release_provenance=None,
                              indent=2):
     """Build the JSON calibration-upload payload from the pre/post AmbitInfo dumps.
 
@@ -804,6 +805,8 @@ def make_calibration_payload(info_precalibration=None, info_postcalibration=None
         calibrate_led(); ``None`` if it was skipped
     :param baseline_cal: six-channel ADPD dark-baseline measurement, QC, and
         readback record; ``None`` if it was skipped
+    :param firmware_release_provenance: revalidated immutable GitHub release,
+        manifest, and flash-asset proof selected for this session
     :param indent: json.dumps indent (None for a compact one-line payload)
     :return: a JSON string ready to send
     :raises ValueError: if either AmbitInfo is missing / never populated
@@ -843,6 +846,7 @@ def make_calibration_payload(info_precalibration=None, info_postcalibration=None
                         "PAR_SENSOR_CALIBRATION":   par_cal,
                         "LED_CALIBRATION":          led_cal,
                         "ADPD_BASELINE_CALIBRATION": baseline_cal,
+                        "FIRMWARE_RELEASE_PROVENANCE": firmware_release_provenance,
                     }
                 ],
             }

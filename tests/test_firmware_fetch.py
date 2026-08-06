@@ -239,6 +239,23 @@ class TestCacheCompleteness(_TempCache):
     def test_complete_proven_cache_is_accepted(self):
         self.assertTrue(firmware_fetch.is_complete(_write_cache_entry(self.cache_root)))
 
+    def test_release_provenance_records_exact_manifest_and_flash_assets(self):
+        version_dir = _write_cache_entry(self.cache_root)
+        proof = firmware_fetch.release_provenance(version_dir)
+        self.assertEqual(firmware_fetch.FIRMWARE_REPO, proof["repository"])
+        self.assertEqual("v1.1.3-rc1", proof["tag"])
+        self.assertTrue(proof["immutable"])
+        self.assertEqual(4, len(proof["flash"]))
+        self.assertEqual(
+            _sha256((version_dir / firmware_fetch.MANIFEST_NAME).read_bytes()),
+            proof["manifest"]["sha256"],
+        )
+        for entry in proof["flash"]:
+            self.assertEqual(
+                _sha256((version_dir / entry["file"]).read_bytes()),
+                entry["sha256"],
+            )
+
     def test_cache_without_release_provenance_fails_closed(self):
         path = _write_cache_entry(self.cache_root, omit_provenance=True)
         self.assertFalse(firmware_fetch.is_complete(path))

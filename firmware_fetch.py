@@ -362,7 +362,13 @@ def validate_release(release):
         canonical = _canonical_asset_url(tag, name)
         if url != canonical:
             raise ValueError(f"release asset {name!r} has non-canonical download URL")
-        assets[name] = {"name": name, "size": size, "sha256": sha256, "url": url}
+        assets[name] = {
+            "id": asset["id"],
+            "name": name,
+            "size": size,
+            "sha256": sha256,
+            "url": url,
+        }
     return tag, assets
 
 
@@ -526,6 +532,45 @@ def is_complete(version_dir):
         logger.debug("cache %s incomplete: %s", version_dir, exc)
         return False
     return True
+
+
+def release_provenance(version_dir):
+    """Return concise, revalidated release/asset proof for calibration records."""
+    version_dir = Path(version_dir)
+    if not is_complete(version_dir):
+        raise ValueError(f"firmware cache {version_dir} is not complete and verified")
+    metadata = read_release_metadata(version_dir)
+    manifest = read_manifest(version_dir)
+    repository = validate_public_repository(metadata.get("repository"))
+    release = metadata.get("release")
+    tag, assets = validate_release(release)
+    entries = manifest_entries(manifest, tag=tag, assets=assets)
+    manifest_asset = assets[MANIFEST_NAME]
+    return {
+        "repository": repository["full_name"],
+        "release_id": release["id"],
+        "tag": tag,
+        "version": manifest["version"],
+        "published_at": release["published_at"],
+        "immutable": True,
+        "manifest": {
+            "asset_id": manifest_asset["id"],
+            "size": manifest_asset["size"],
+            "sha256": manifest_asset["sha256"],
+            "url": manifest_asset["url"],
+        },
+        "flash": [
+            {
+                "asset_id": assets[name]["id"],
+                "file": name,
+                "offset": offset,
+                "size": size,
+                "sha256": sha256,
+                "url": assets[name]["url"],
+            }
+            for offset, name, size, sha256 in entries
+        ],
+    }
 
 
 def cached_versions(cache_root):
