@@ -109,8 +109,17 @@ only through the explicit runner path with a uniquely detected CH343 bridge.
 
 - Confirm the reference MiniPAR placement, DC-source current limits, and AMBIT
   optical alignment before starting.
+- The ADPD baseline step writes nothing until the operator installs the dark
+  fixture and types `DARK`. It measures first, rejects an unsafe `s_630`
+  baseline, then saves all six channels atomically and verifies them after a
+  reboot.
 - Set `UPLOAD_GAINS = False` to inspect fits without writing calibration gains.
-- A poor LED fit is reported and the new LED gain is not uploaded.
+- PAR and LED gains use a through-origin fit. Writes are blocked unless all
+  samples are finite, non-negative, sufficiently ranged and monotonic, with
+  R² at least 0.99, normalized RMSE at most 5%, maximum residual at most 10%
+  of full scale, and free-fit intercept at most 5% of full scale.
+- Every written gain is read back after reboot. A mismatch triggers restoration
+  and verification of the previous value.
 - Keep `RENAME_AMBIT = False` unless a device rename is intended.
 - Calibration payloads are written to ignored `calibrations/` before optional
   MQTT publication. Check certificate paths and topic configuration separately.
@@ -128,8 +137,9 @@ Fixtures under `tests/fixtures/` capture the anonymous production REST/manifest
 contract for `v1.1.3-rc1`. Tests cover selection policy, future stable releases,
 public/immutable state, canonical URLs, missing and mismatched size/digest data,
 unsafe paths, wrong chip, cache tampering, offline fallback, prerelease identity,
-upgrade-only behavior, explicit downgrade control, and the merged OpenJII
-spectrometer/leaf behavior. GitHub Actions runs the same suite on pushes and PRs.
+upgrade-only behavior, explicit downgrade control, the calibration fit gates,
+and the merged OpenJII spectrometer/leaf behavior. GitHub Actions runs the same
+suite on pushes and PRs.
 
 ## Release provenance: `v1.1.3-rc1`
 
