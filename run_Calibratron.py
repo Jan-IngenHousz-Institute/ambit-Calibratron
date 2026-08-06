@@ -92,6 +92,7 @@ CALIBRATE_ADPD_BASELINE = True
 _HELLO_FW_RE = re.compile(
     r"FW:\s*([0-9]+(?:\.[0-9]+){2}(?:-[0-9A-Za-z][0-9A-Za-z.-]*)?)"
 )
+_firmware_release_provenance = None
 
 
 def _detect_ambit_version():
@@ -149,8 +150,10 @@ def flash_firmware(force_flash=False, current_version=None,
     :param cache_root: firmware cache folder to download into.
     :return: 0 on success (including a deliberately skipped flash), 1 on failure.
     """
+    global _firmware_release_provenance
     try:
         version, firmware_dir = firmware_fetch.fetch_latest(cache_root)
+        _firmware_release_provenance = firmware_fetch.release_provenance(firmware_dir)
     except (urllib.error.URLError, RuntimeError, OSError) as exc:
         print(f"[flash] could not obtain the Ambit firmware: {exc}")
         return 1
@@ -527,6 +530,7 @@ def main():
     payload = helpers.make_calibration_payload(
         info_precalibration, info_postcalibration,
         par_cal=par_cal, led_cal=led_cal, baseline_cal=baseline_cal,
+        firmware_release_provenance=_firmware_release_provenance,
     )
     print(payload)
 

@@ -122,7 +122,9 @@ only through the explicit runner path with a uniquely detected CH343 bridge.
   and verification of the previous value.
 - Keep `RENAME_AMBIT = False` unless a device rename is intended.
 - Calibration payloads are written to ignored `calibrations/` before optional
-  MQTT publication. Check certificate paths and topic configuration separately.
+  MQTT publication. They include the revalidated immutable release, manifest,
+  asset IDs, URLs, sizes, and SHA-256 digests selected for that session. Check
+  certificate paths and topic configuration separately.
 
 ## Tests
 
