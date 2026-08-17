@@ -14,6 +14,11 @@ paho-mqtt>=2.0        # MQTT v5 publishing (mqtt_publish.py, helpers.publish_pay
 esptool               # ESP32 firmware flashing (uploader.py); on Windows the bundled
                       # firmware_ambit/esptool.exe is used instead, so this is optional there
 
+# Not a pip package: run_Calibratron.py downloads Ambit firmware from the
+# ambit-iot GitHub releases, which is a private repo, so the GitHub CLI must be
+# installed and logged in:
+#   https://cli.github.com  then  gh auth login
+
 # Needed only to run the .ipynb notebooks from a plain Python install;
 # skip these if you open the notebooks via the VS Code Jupyter extension.
 ipykernel

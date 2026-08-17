@@ -3,6 +3,11 @@ ambit_calibration_1_certs/
 test.ipynb
 calibrations/
 
+# Firmware releases downloaded from GitHub by helpers.fetch_ambit_release()
+firmware_ambit/releases/
+# Remembered COM port -> instrument mapping (bench-local)
+.port_roles.json
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
