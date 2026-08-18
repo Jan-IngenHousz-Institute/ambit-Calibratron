@@ -132,8 +132,10 @@ def find_devices(specs, timeout=4.0, poll=0.25, ports=None, verbose=False):
     """
     pending = dict(specs)
     found = {}
+    unopenable = []
 
-    for port in (serial_ports() if ports is None else list(ports)):
+    scanned = serial_ports() if ports is None else list(ports)
+    for port in scanned:
         if not pending:
             break
         try:
@@ -169,12 +171,28 @@ def find_devices(specs, timeout=4.0, poll=0.25, ports=None, verbose=False):
                 elif verbose:
                     logger.info("No match on %s. Received: %s", port, msg.strip())
         except (OSError, serial.SerialException) as exc:
-            logger.debug("Cannot open %s: %s", port, exc)
+            # A warning, not a debug line: a bench instrument that is plugged in
+            # but whose port will not open looks *identical* to one that is
+            # unplugged, and the operator can act on the difference (another
+            # process holding it, a driver that dropped out, a power-cycled USB
+            # bridge). Silence here is what makes a missing role a mystery.
+            logger.warning("Cannot open %s (skipped): %s", port, exc)
+            unopenable.append(port)
             invalidate_port_cache()
             continue
 
     for role in pending:
-        logger.warning("No device found for role %r", role)
+        question = specs[role][0].strip()
+        # The port *names* matter more than the count: a role missing because the
+        # instrument's port never enumerated looks nothing like a role missing
+        # because the instrument did not answer, and only the list distinguishes
+        # them. Windows hands out whatever port number it likes, so "the one I
+        # expected is absent" is the operator's call to make, not this code's.
+        logger.warning("No device found for role %r: asked %r on %s",
+                       role, question, ", ".join(scanned) or "no ports at all")
+        if unopenable:
+            logger.warning("  %d port(s) could not be opened at all: %s",
+                           len(unopenable), ", ".join(unopenable))
         found[role] = None
     return found
 
@@ -275,16 +293,31 @@ class AmbitProto:
     #: The only reply that means the value reached NVS.
     SAVE_CONFIRMED = "saved and verified"
 
+    #: ``set_currents`` echo, from the firmware's own printf. Matched as a prefix
+    #: so the values it reports back stay available for logging.
+    CURRENTS_ACK = "Currents set"
+
     # actinic LED (unrelated to the PAR chain, still a live calibration)
     SET_ACT      = "set_act, {coeff:.4f}\n"
     SET_CURRENTS = "set_currents,{i620:d},{i720:d},{ir:d},\n"
-    LED_RUN      = "arrun1,1,1,2,0,0,1,0,1,{led:d},1,\n, \n"
+    # The trailing padding is "\n,\n" and NOT "\n, \n". That space was the
+    # whole bug behind six BAD COMMANDs a run. The device's command reader
+    # (Serial_Input_Chars(choose, ":,", 200) in ambit/src/ambit-1.ino) *skips* CR/LF
+    # without storing them, but a space is printable: it is stored as token byte 0
+    # and it restarts a 200 ms inter-character window. Whatever the host sends
+    # inside that window is appended to it, so "set_currents,0,0,0," arrives as the
+    # token " set_currents" - and do_command() silently drops any token whose first
+    # character fails isalnum(). The verb is gone; its three "0" arguments are then
+    # read as commands, and a digit-leading token goes through atoi into a switch
+    # with no numeric cases at all: BAD COMMAND, three times over.
+    # Without the space the padding stores nothing, so no window opens.
+    LED_RUN      = "arrun1,1,1,2,0,0,1,0,1,{led:d},1,\n,\n"
 
     # ADPD photodiode trace. Type 2 (no IR reflect), far-red off, sample count
     # and frequency as hi,lo byte pairs, actinic setting, then the trailing 1 that
     # sets ambient sub-sampling to every point - which is the only reason `sun`
     # and `leaf` get populated at all.
-    ARRUN2       = "arrun2,1,0,2,0,{nh:d},{nl:d},{fh:d},{fl:d},{act:d},1,\n, \n"
+    ARRUN2       = "arrun2,1,0,2,0,{nh:d},{nl:d},{fh:d},{fl:d},{act:d},1,\n,\n"
 
     # ADPD dark baseline
     MEASURE_BASELINE = "baseline,0\n"
@@ -327,28 +360,43 @@ HELLO_FW_RE = re.compile(r"FW:\s*([0-9]+(?:\.[0-9]+){2}(?:-[0-9A-Za-z][0-9A-Za-z
 # Low-level serial
 # ============================================================================
 
-def _query(port, cmd, decode="utf-8", timeout=2.0):
-    """Open, flush, write, readline. For the bench instruments (not the Ambit)."""
-    with serial.Serial(port, baudrate=BAUDRATE, timeout=timeout) as ser:
-        ser.flush()
-        ser.write(cmd.encode())
-        return ser.readline().decode(encoding=decode, errors="replace").strip()
+#: Lines the ESP32 ROM and second-stage bootloader print on reset. None of them
+#: is ever a reply to a command, and every one of them will happily parse as
+#: "not a float" if a caller mistakes it for one.
+_BOOT_CHATTER_RE = re.compile(
+    r"^(ESP-ROM:|rst:0x|boot:0x|configsip:|clk_drv:|mode:[A-Z]|load:0x|entry 0x|"
+    r"Saved PC:|SPIWP:|SPI (Speed|Mode|Flash)|csum |ets |invalid header:|"
+    r"waiting for download|[IWED] \()")
+
+#: Retryable negative acknowledgements. A bench instrument answers this when the
+#: command line it received was mangled - which is exactly what a reset in the
+#: middle of a write produces - so it means "ask again", not "unsupported".
+_ERROR_REPLY_PREFIX = "error"
+
+#: Attempts per bench question, and the pause between them (enough for an
+#: ESP32-class board to finish booting if one did slip through).
+QUERY_ATTEMPTS = 3
+QUERY_RETRY_S = 0.4
 
 
-def _command(port, cmd):
-    """Open, flush, write. Fire-and-forget."""
-    with serial.Serial(port, baudrate=BAUDRATE) as ser:
-        ser.flush()
-        ser.write(cmd.encode())
+def is_boot_chatter(line):
+    """Is this line bootloader output rather than a reply?"""
+    return bool(_BOOT_CHATTER_RE.match(line.strip()))
 
 
-def open_ambit_serial(port, timeout=2.0):
-    """Open the Ambit port WITHOUT triggering the device's auto-reset.
+def open_serial_no_reset(port, timeout=2.0):
+    """Open a port WITHOUT triggering the device's auto-reset.
 
-    The flasher bridge wires DTR/RTS to the ESP32-C3 reset/boot pins, so the
-    usual "open then assert DTR/RTS" sequence reboots the device. Setting DTR/RTS
-    to a steady state *before* opening avoids the reset edge, which matters both
-    for a latched actinic LED and for keeping one port open across a whole sweep.
+    Every instrument on this bench except the DC source is an ESP32-class board
+    whose reset (and, on the Ambit's flasher bridge, boot) pin is wired to
+    DTR/RTS, so the usual "open, then assert DTR/RTS" sequence reboots it.
+    Setting DTR/RTS to a steady state *before* opening avoids the reset edge.
+
+    Why this matters beyond speed: a reset at open means the command is written
+    into a booting device, so the reply is boot chatter, or ``error:...`` from a
+    half-swallowed command line, or - worst - a plausible-looking number left
+    over from before the reset. It also drops a latched actinic LED, and it is
+    what lets one port be held open across a whole sweep.
     """
     ser = serial.Serial()
     ser.port = port
@@ -358,6 +406,83 @@ def open_ambit_serial(port, timeout=2.0):
     ser.rts = False
     ser.open()
     return ser
+
+
+#: Kept as the name the Ambit paths use; the behaviour is identical.
+open_ambit_serial = open_serial_no_reset
+
+
+def _read_reply(ser, decode, timeout, validate):
+    """First plausible line, or ``(None, last_line_seen)`` if none arrived.
+
+    Blank lines and boot chatter are skipped without consuming an attempt: they
+    are not answers to anything. A line that *is* an answer but fails
+    ``validate`` ends the attempt, because the question is worth re-asking.
+    """
+    deadline = time.time() + timeout
+    last = ""
+    while time.time() < deadline:
+        raw = ser.readline()
+        if not raw:
+            break                      # read timeout: nothing more is coming
+        line = raw.decode(encoding=decode, errors="replace").strip()
+        if not line or is_boot_chatter(line):
+            continue                   # not an answer to anything
+        last = line
+        if line.lower().startswith(_ERROR_REPLY_PREFIX):
+            return None, line
+        if validate is None or validate(line):
+            return line, line
+        return None, line
+    return None, last
+
+
+def _query(port, cmd, decode="utf-8", timeout=2.0, validate=None,
+           attempts=QUERY_ATTEMPTS):
+    """Ask a bench instrument one question and return the first plausible reply.
+
+    Opened without the DTR/RTS reset edge (see :func:`open_serial_no_reset`), and
+    the port is held open across the retries so a device that *did* reset only
+    pays for it once. Anything already in the input buffer predates the question
+    and is dropped.
+
+    ``validate`` is the caller's notion of a well-formed reply - pass one
+    whenever the reply has a shape, because the failure this guards against is a
+    stale or truncated line that parses cleanly into the wrong number.
+
+    :return: the reply, or the last line seen (possibly ``""``) if no attempt
+        produced a plausible one - so callers keep reporting what they *did* hear
+    """
+    last = ""
+    with open_serial_no_reset(port, timeout=timeout) as ser:
+        for attempt in range(max(1, attempts)):
+            ser.reset_input_buffer()
+            ser.reset_output_buffer()
+            ser.write(cmd.encode())
+            ser.flush()
+            reply, last = _read_reply(ser, decode, timeout, validate)
+            if reply is not None:
+                if attempt:
+                    logger.debug("%s answered %r on attempt %d", port, reply,
+                                 attempt + 1)
+                return reply
+            logger.debug("%s: no plausible reply to %r (attempt %d/%d, saw %r)",
+                         port, cmd.strip(), attempt + 1, attempts, last)
+            time.sleep(QUERY_RETRY_S)
+    return last
+
+
+def _command(port, cmd):
+    """Open, flush, write. Fire-and-forget.
+
+    Left on pyserial's default DTR/RTS assert on purpose: the only user is the
+    Kiprim DC source, which is not an ESP32-class board and has no reset line on
+    those pins - and some USB-serial bridges hold their output until DTR is
+    asserted, so the no-reset open would be a regression there rather than a fix.
+    """
+    with serial.Serial(port, baudrate=BAUDRATE) as ser:
+        ser.flush()
+        ser.write(cmd.encode())
 
 
 def _wait_for_ready(ser, expected=AmbitProto.HELLO_ACK, max_retries=10):
@@ -375,6 +500,15 @@ def _wait_for_ready(ser, expected=AmbitProto.HELLO_ACK, max_retries=10):
 # ============================================================================
 # Ambit link: one open port, text and binary on the same UART
 # ============================================================================
+
+#: The device's command-token reader uses a 200 ms inter-character timeout
+#: (``Serial_Input_Chars(choose, ":,", 200, ...)`` in ambit/src/ambit-1.ino). Waiting
+#: longer than that before sending the next verb guarantees the reader has closed
+#: the previous token, whatever USB packetisation did to the line. ``set_actinic``
+#: has always slept 0.3 s here, and that is exactly why its own padding never cost
+#: anything - ``arrun`` returned the instant it saw "Data sent" and did not.
+CONSOLE_TOKEN_SETTLE_S = 0.25
+
 
 class AmbitLink:
     """A held-open, non-resetting connection to one Ambit.
@@ -409,8 +543,29 @@ class AmbitLink:
         return False
 
     # ---- text -------------------------------------------------------------
-    def text(self, cmd, n_lines=1, timeout=None):
-        """Send a text command and read ``n_lines`` replies."""
+    def text(self, cmd, n_lines=1, timeout=None, expect=None):
+        """Send a text command and read ``n_lines`` replies.
+
+        ``expect`` is a substring the answer must contain, and it exists because
+        ``reset_input_buffer`` cannot drop what has not arrived yet. The console
+        emits stale lines *after* the flush for two firmware reasons, both
+        expected rather than faulty:
+
+        * ``Serial_Input_Long`` gives each numeric field a **10 ms** timeout
+          (ambit/src/serial.cpp). An ``arrun1`` / ``arrun2`` line that arrives in
+          more than one USB packet leaves its tail unconsumed, and the tail is then
+          read as a *command*: a numeric token dispatches through ``atoi`` into a
+          switch with no such case, so the device answers ``BAD COMMAND``.
+        * ``arrun1`` prints ``Done`` unconditionally, and its ``T:`` plot lines
+          keep coming until the trace ends.
+
+        Reading exactly one line therefore attributes the previous command's
+        leftovers to this one. With ``expect``, non-matching lines are discarded
+        until the deadline, so ``set_currents`` is judged on the device's own
+        ``Currents set to ...`` and not on the residue of the trace before it.
+
+        :return: the matching line (or the last line seen, if none matched)
+        """
         ser = self._require()
         old = ser.timeout
         if timeout is not None:
@@ -418,11 +573,31 @@ class AmbitLink:
         try:
             ser.reset_input_buffer()
             ser.write(cmd.encode())
-            lines = [ser.readline().decode("unicode_escape", errors="replace").strip()
-                     for _ in range(n_lines)]
+            if expect is None:
+                lines = [ser.readline().decode("unicode_escape", errors="replace").strip()
+                         for _ in range(n_lines)]
+                return lines[0] if n_lines == 1 else lines
+
+            deadline = time.time() + (timeout if timeout is not None else old or 2.0)
+            last, discarded = "", []
+            while time.time() < deadline:
+                raw = ser.readline()
+                if not raw:
+                    break
+                line = raw.decode("unicode_escape", errors="replace").strip()
+                if not line:
+                    continue
+                if expect in line:
+                    if discarded:
+                        logger.debug("discarded %d stale console line(s) before "
+                                     "%r echo: %s", len(discarded),
+                                     cmd.strip().split(",")[0], discarded)
+                    return line
+                last = line
+                discarded.append(line)
+            return last
         finally:
             ser.timeout = old
-        return lines[0] if n_lines == 1 else lines
 
     # ---- binary -----------------------------------------------------------
     def binary(self, frame, resp_size, timeout=5.0):
@@ -503,17 +678,62 @@ class AmbitLink:
                 self.text(AmbitProto.GET_SPEC_CAL, n_lines=8, timeout=timeout))
 
     # ---- ADPD photodiode trace ------------------------------------------
-    def set_actinic(self, setting):
+    def set_actinic(self, setting, timeout=4.0):
         """Latch the actinic LED on at ``setting`` and leave it lit.
 
         On the link rather than its own connection so a sweep point can latch the
         LED, read the references and record an ADPD trace without ever closing
         the port - closing and reopening with DTR/RTS asserted would reset the
-        device and drop the latch. Firmware forces the LED off for settings <= 3.
+        device and drop the latch. Firmware forces the LED off for settings <= 3
+        (``if (actinic > 3)`` in ``run_arr_type1``, ambit/src/PAM.cpp).
+
+        Read to completion rather than fired and forgotten, because this command
+        can fail silently in two different ways and both leave the LED dark:
+
+        * ``LED_RUN`` is ``arrun1``, whose every numeric field is parsed with
+          ``Serial_Input_Long(",", 10)`` - a **10 ms** per-field timeout
+          (ambit/src/serial.cpp). A field that does not arrive in time reads back
+          ``atol("") == 0``. If ``len`` reads 0 the run never happens at all; if
+          ``persist`` reads 0 the run ends with ``AS_LED_OFF()``
+          (ambit/src/PAM.cpp). Nothing is reported in either case.
+        * ``arrun1`` prints ``Done`` unconditionally, so ``Done`` alone proves
+          only that the command was dispatched.
+
+        What does discriminate is the per-point ``T:...`` line: ``arrun1`` sets
+        ``CONNECTION_TYPE = PLOTTING`` and one such line is emitted per sampled
+        point, so seeing at least one proves ``len`` parsed as >= 1 and the trace
+        really ran. ``persist`` still cannot be confirmed from the device side -
+        only the reference MiniPAR can see whether the LED stayed lit, which is
+        why :func:`run_calibratron._led_reference_sweep` verifies it there.
+
+        :return: True if the device emitted at least one sampled point
         """
-        self.text(AmbitProto.LED_RUN.format(led=int(setting)), timeout=2.0)
+        ser = self._require()
+        old_timeout = ser.timeout
+        ser.timeout = 0.5
+        ran = False
+        try:
+            ser.reset_input_buffer()
+            ser.write(AmbitProto.LED_RUN.format(led=int(setting)).encode())
+            ser.flush()
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                raw = ser.readline()
+                if not raw:
+                    continue
+                line = raw.decode("utf-8", errors="replace").strip()
+                if line.startswith("T:"):
+                    ran = True
+                elif line == "Done":
+                    break
+        finally:
+            ser.timeout = old_timeout
+        if not ran:
+            logger.warning("set_actinic(%s): no sampled point reported; the "
+                           "arrun1 field parse may have timed out", setting)
         time.sleep(0.3)
-        self._require().reset_input_buffer()
+        ser.reset_input_buffer()
+        return ran
 
     def zero_pulse_currents(self):
         """Zero the ADPD pulse LEDs (620 / 720 / IR).
@@ -528,9 +748,14 @@ class AmbitLink:
         :return: True if the device echoed the expected confirmation
         """
         echo = self.text(AmbitProto.SET_CURRENTS.format(i620=0, i720=0, ir=0),
-                         timeout=2.0)
-        if "Currents set" not in echo:
-            logger.warning("unexpected set_currents echo: %r", echo)
+                         timeout=2.0, expect=AmbitProto.CURRENTS_ACK)
+        if AmbitProto.CURRENTS_ACK not in echo:
+            # Not "unsupported": the verb exists in every firmware this bench
+            # flashes (ambit/src/do_command.h, case hash("set_currents")). A
+            # BAD COMMAND here is the console answering an earlier stray token,
+            # so say what was actually heard and that the LEDs stayed live.
+            logger.warning("set_currents not acknowledged (last console line: %r); "
+                           "ADPD pulse LEDs may still be driving", echo)
             return False
         return True
 
@@ -578,11 +803,23 @@ class AmbitLink:
         if not got_end:
             logger.warning("arrun: 'Data sent' not received within %ss (tags: %s)",
                            timeout, sorted(data))
+        # Let the console's token reader time out before anyone writes again, and
+        # drop whatever the trace left behind. Without this the *next* command
+        # lands inside the reader's 200 ms window and can be swallowed whole -
+        # which is how six of seven set_currents calls disappeared and the ADPD
+        # pulse LEDs stayed live through every trace of a sweep.
+        self._settle_console()
+
         if not data:
             return None
         return {"actinic": int(actinic), "num_points": int(num_points),
                 "freq_hz": int(freq), "pulse_currents_zeroed": zeroed,
                 "truncated": not got_end, "data": data}
+
+    def _settle_console(self, delay=CONSOLE_TOKEN_SETTLE_S):
+        """Wait out the device's command-token timeout, then drop stale input."""
+        time.sleep(delay)
+        self._require().reset_input_buffer()
 
     # ---- tier-3 setters ---------------------------------------------------
     def set_par_slope(self, value):
@@ -713,14 +950,36 @@ def set_voltage(port, voltage):
     _command(port, DCSourceProto.SET_VOLTAGE.format(v=voltage))
 
 
+class ReferenceUnavailable(RuntimeError):
+    """The PAR reference stopped answering. A sweep point without a reference is
+    not a calibration point, so this aborts the sweep rather than degrading it."""
+
+
+def _looks_like_float(line):
+    try:
+        float(line)
+    except ValueError:
+        return False
+    return True
+
+
 def get_par_MP(port):
-    """The MiniPAR's calibrated PAR, in umol m-2 s-1."""
-    return float(_query(port, MiniParProto.GET_PAR_CAL))
+    """The MiniPAR's calibrated PAR, in umol m-2 s-1.
+
+    :raises ReferenceUnavailable: if no attempt produced a number
+    """
+    resp = _query(port, MiniParProto.GET_PAR_CAL, validate=_looks_like_float)
+    try:
+        return float(resp)
+    except ValueError:
+        raise ReferenceUnavailable(
+            f"MiniPAR on {port} did not return a PAR value in "
+            f"{QUERY_ATTEMPTS} attempts (last reply: {resp!r})") from None
 
 
 def get_par_raw_MP(port):
     """The MiniPAR's PAR before its own slope/intercept, or None."""
-    resp = _query(port, MiniParProto.GET_PAR_RAW)
+    resp = _query(port, MiniParProto.GET_PAR_RAW, validate=_looks_like_float)
     try:
         return float(resp)
     except ValueError:
@@ -735,7 +994,8 @@ def get_spec_raw_MP(port):
     from ambit. :func:`minipar_to_ambit_order` does the swap; plan section 8
     explains why getting it wrong fails quietly rather than loudly.
     """
-    resp = _query(port, MiniParProto.GET_SPEC_RAW)
+    resp = _query(port, MiniParProto.GET_SPEC_RAW,
+                  validate=lambda line: "," in line)
     try:
         model, *counts = resp.split(",")
         if model.startswith("error") or not counts:
@@ -761,7 +1021,8 @@ def minipar_to_ambit_order(values):
 
 def get_spec_status_MP(port):
     """The MiniPAR's live acquisition settings, or None."""
-    resp = _query(port, MiniParProto.SPEC_STATUS)
+    resp = _query(port, MiniParProto.SPEC_STATUS,
+                  validate=lambda line: "model=" in line)
     kv = dict(tok.split("=", 1) for tok in resp.split(",") if "=" in tok)
     if "model" not in kv:
         logger.warning("MiniPAR status unavailable (reply: %r)", resp)
@@ -777,7 +1038,13 @@ def get_spec_status_MP(port):
 
 def get_spec_coeff_MP(port):
     """The MiniPAR's per-channel PAR coefficients, read off the device."""
-    resp = _query(port, MiniParProto.GET_SPEC_COEF)
+    # A vector cut short by a reset mid-print still parses as floats, so the
+    # channel count is the part worth checking: the reply carries one coefficient
+    # per AS7341 channel (the first N_CHANNELS of which are the ones used).
+    resp = _query(port, MiniParProto.GET_SPEC_COEF,
+                  validate=lambda line: (
+                      len(line.split(",")) >= spec_cal.N_CHANNELS
+                      and all(_looks_like_float(v) for v in line.split(","))))
     try:
         return [float(v) for v in resp.split(",")]
     except ValueError:
@@ -787,7 +1054,8 @@ def get_spec_coeff_MP(port):
 
 def get_cal_par_MP(port):
     """The MiniPAR's own PAR slope / intercept, or None."""
-    resp = _query(port, MiniParProto.GET_CAL_PAR)
+    resp = _query(port, MiniParProto.GET_CAL_PAR,
+                  validate=lambda line: "slope=" in line and "intercept=" in line)
     kv = dict(tok.split("=", 1) for tok in resp.split(",") if "=" in tok)
     try:
         return {"slope": float(kv["slope"]), "intercept": float(kv["intercept"])}
@@ -799,17 +1067,18 @@ def get_cal_par_MP(port):
 def read_minipar_reference(port):
     """Snapshot the reference MiniPAR's identity and settings.
 
-    This defines the PAR that ambit's tier 3 is anchored to, so it is recorded
-    in full - see :data:`spec_cal.REFERENCE_TRANSFER_NOTE` for what accepting a
-    MiniPAR instead of a Li-250A costs, and why one later Li-250A comparison can
-    retire it without re-running the bench.
+    This defines the PAR that ambit's tier 3 is anchored to, so it is recorded in
+    full: its settings and its own slope/intercept are what a later Li-250A
+    comparison would need in order to rescale every stored sweep. What accepting
+    a MiniPAR instead of a Li-250A costs is argued in the README ("The MiniPAR as
+    reference instead of a Li-250A") rather than restated in every payload.
     """
     return {
-        "name": _query(port, MiniParProto.GET_NAME),
+        "name": _query(port, MiniParProto.GET_NAME,
+                       validate=lambda line: "," not in line),
         "spec_status": get_spec_status_MP(port),
         "par_coefficients": get_spec_coeff_MP(port),
         "calibration": get_cal_par_MP(port),
-        "transfer_note": dict(spec_cal.REFERENCE_TRANSFER_NOTE),
     }
 
 

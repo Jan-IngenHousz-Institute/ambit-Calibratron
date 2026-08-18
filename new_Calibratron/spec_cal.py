@@ -115,17 +115,51 @@ SEED_SPEC_OFFSET = (0.00196979, 0.00724927, 0.00319381, 0.001314659, 0.001468153
 SEED_SPEC_SENS = (34.950663, 65.289484, 72.697997, 63.273264, 56.737110,
                   52.958660, 48.706781, 42.671670, 5.781618, 31.565986)
 
-#: miniPar Li-250A campaign, OLS on basic counts, 462 samples, tier-2 intercept
-#: discarded (7c). Four channels have unphysical signs - that is collinearity
-#: (condition number ~451), not spectral response. Do not extrapolate it.
-SEED_PAR_WEIGHT = (333.463542, 206.427134, -30.6130744, 283.778061, -144.07319,
-                   73.852848, 38.9285016, -6.43585093, -37.6580353, 16.9097651)
+#: miniPar Li-250A campaign, ``lsq_linear`` on basic counts with **F1-F8 >= 0**
+#: and Clear/NIR free, shrunk toward ``W_TARGET`` at lambda=0.03, 462 samples over
+#: 6 devices, tier-2 intercept discarded (7c). Leave-one-device-out median 4.38%.
+#: Exported by ``miniPar/new_calibration_miniPAR/par_coeffs_fleet.json``.
+#:
+#: The sign pattern is now the physical one: the eight band channels lift PAR and
+#: only NIR subtracts. That is the point of the constraint. The superseded plain
+#: OLS vector (see :data:`SUPERSEDED_PAR_WEIGHTS`) put negative weight on F3, F5
+#: and F8, which was collinearity - condition number ~451 on a daylight-dominated
+#: set - rather than spectral response, and it cost accuracy exactly where the
+#: spectrum stops looking like daylight: canopy PAR spread 6.2% unconstrained
+#: against 0.4% here, coefficient direction spread p95 62 deg against 8 deg.
+#:
+#: Still a *seed*: fitted on miniPar optics, so flags bit8 stays clear and PAR
+#: stays provisional until an ambit Li-250A campaign lands.
+#:
+#: One caveat carried from the export: ``prior_is_placeholder`` is true, so the
+#: shrinkage target is not yet the computed CM weight vector. Expect one more
+#: generation of this seed.
+SEED_PAR_WEIGHT = (40.8063026, 42.1780116, 69.8493647, 85.8748691, 61.8955888,
+                   43.742399, 51.5713801, 14.7054614, -27.2526003, 19.3083196)
+
+#: Earlier seeds, kept so a device flashed with one is *identified* rather than
+#: reported as carrying an unknown measured vector.
+#:
+#: Without this the transition is silent in the worst direction: after the seed
+#: is bumped, every device still on the previous firmware fails
+#: :meth:`SpecCal.seed_match` on ``par_weight``, and a False there reads as
+#: "someone wrote a fitted vector here" - which is what the field means
+#: everywhere else. Provenance is the whole job of these constants, so a
+#: recognised old seed must say which one it is.
+SUPERSEDED_PAR_WEIGHTS = {
+    # Plain OLS, no sign constraint. Unphysical negatives on F3, F5 and F8 and a
+    # positive Clear; L1 norm 1172 against 457 here for a 1.8x larger net
+    # response, i.e. 2.6x the leverage on spectral shape for the same answer.
+    "minipar-2026-08-17-ols": (333.463542, 206.427134, -30.6130744, 283.778061,
+                               -144.07319, 73.852848, 38.9285016, -6.43585093,
+                               -37.6580353, 16.9097651),
+}
 
 TIER3_IDENTITY = (1.0, 0.0)   # par_slope, par_intercept - deliberately not seeded (7d)
 
 #: Provenance string stored with every calibration, so a record says which
 #: generation of firmware seeds the tier-3 fit was taken on top of.
-SEED_GENERATION = "minipar-2026-08-17"
+SEED_GENERATION = "minipar-2026-08-18-constrained"
 
 
 # ============================================================================
@@ -375,6 +409,30 @@ class SpecCal:
             "par_weight":  same(self.par_weight, SEED_PAR_WEIGHT),
         }
 
+    def par_weight_generation(self, rtol=1e-4):
+        """Which generation of shipped ``par_weight`` this device carries.
+
+        Deliberately a separate method rather than a fourth key in
+        :meth:`seed_match`: that dict is three booleans and
+        :func:`read_par_provisional` filters it by truthiness, so a string in
+        there would read as a match.
+
+        :return: :data:`SEED_GENERATION`, a key of
+            :data:`SUPERSEDED_PAR_WEIGHTS`, or None for a vector that is neither -
+            which means a fitted one, the outcome the campaign is for
+        """
+        def same(want):
+            return len(self.par_weight) == len(want) and all(
+                math.isclose(a, b, rel_tol=rtol, abs_tol=1e-12)
+                for a, b in zip(self.par_weight, want))
+
+        if same(SEED_PAR_WEIGHT):
+            return SEED_GENERATION
+        for generation, vector in SUPERSEDED_PAR_WEIGHTS.items():
+            if same(vector):
+                return generation
+        return None
+
     def to_dict(self):
         return {
             "format": self.format,
@@ -388,6 +446,7 @@ class SpecCal:
             "tier3_is_identity": self.tier3_is_identity(),
             "seed_match": self.seed_match(),
             "seed_generation": SEED_GENERATION,
+            "par_weight_generation": self.par_weight_generation(),
         }
 
 
@@ -432,7 +491,7 @@ def parse_spec_cal_text(reply):
 
         spec_offset:0.00196979,0.00724927,...
         spec_sens:34.9506626,65.2894843,...
-        par_weight:333.463542,206.427134,...
+        par_weight:40.8063026,42.1780116,...
         par_slope:1
         par_intercept:0
 
@@ -495,9 +554,9 @@ def usable_for_fit(spec_raw):
     tier 3 is fitted as a straight line, so a clipped point is off-model by
     construction. It also breaks the specific argument that lets miniPar's
     ``par_weight`` be reused at all: section 7c reuses it because ambit's extra
-    offset subtraction costs a *constant* ``SUM w_i * offset_i`` = 2.40 umol,
-    which tier 3's intercept absorbs exactly. That constancy holds only while no
-    channel is clipped. Once ``s`` saturates at zero, the offset term stops being
+    offset subtraction costs a *constant* ``SUM w_i * offset_i`` = 1.09 umol
+    (2.40 under the superseded OLS seed), which tier 3's intercept absorbs
+    exactly. That constancy holds only while no channel is clipped. Once ``s`` saturates at zero, the offset term stops being
     constant and the relation stops being affine.
 
     The practical consequence is sharp: a fully clipped dark reading has
@@ -548,8 +607,18 @@ def read_par_provisional(spec_raw, spec_cal):
     on_seeds = [name for name, matched in seeds.items()
                 if matched and name != "spec_offset"]
     tier3_unset = spec_cal.tier3_is_identity()
+    par_weight_generation = spec_cal.par_weight_generation()
 
     reasons = []
+    if (par_weight_generation is not None
+            and par_weight_generation != SEED_GENERATION):
+        # Reported whatever the bits say. bit8 is one bit and cannot carry a
+        # generation, so a device on last month's firmware is indistinguishable
+        # from one on this month's by flags alone - and the tier-3 fit is only
+        # interpretable against the tier-2 vector it sat on.
+        reasons.append(f"par_weight is the superseded {par_weight_generation} "
+                       f"seed, not {SEED_GENERATION} - reflash before trusting "
+                       f"a tier-3 fit taken on it")
     flag_fleet = flag_tier3 = None
     if spec_raw is not None:
         flag_fleet = spec_raw.par_weight_is_fleet_fit
@@ -589,6 +658,7 @@ def read_par_provisional(spec_raw, spec_cal):
         "on_seeds": on_seeds,
         "flag_vector_agreement": not disagreement,
         "seed_generation": SEED_GENERATION,
+        "par_weight_generation": par_weight_generation,
     }
 
 
@@ -724,17 +794,24 @@ def assess_affine_fit(x_values, y_values, stimulus, *,
       rejection. Forcing the line through the origin would fold a genuine
       additive offset into the slope, turning a constant error into a
       proportional one - worst exactly at low light, where a canopy or shade
-      measurement lives. The plan measures that offset directly: refitting
-      ambit's chain over miniPar's data returns ``a = 1.0000, b = 7.983``
-      (section 7c), because tier 3 absorbs both the dark-offset term
-      (2.40 umol) and miniPar's discarded tier-2 intercept (5.61 umol).
+      measurement lives. Tier 3's intercept absorbs two additive terms: the
+      dark-offset term ``SUM w_i * offset_i``, which is 1.09 umol on the current
+      seed, and miniPar's discarded tier-2 ``b0``. Under the superseded OLS seed
+      those were 2.40 and 5.61 umol and the plan measured their sum directly
+      (refitting ambit's chain over miniPar's data returned ``a = 1.0000,
+      b = 7.983``, section 7c). That total cannot be restated for the current
+      seed: ``par_coeffs_fleet.json`` does not export the ``b0`` its constrained
+      fit discarded, so only the 1.09 umol half is known here. Which is a reason
+      to fit the intercept, not to predict it.
     - Residuals, R^2 and NRMSE are scored against the affine prediction, so the
       R^2 gate tests linearity rather than whether the intercept happens to be
       small.
-    - Negative inputs are permitted. The seeded ``par_weight`` has negative
-      coefficients on F3, F5, F8 and NIR (section 7c), so a legitimate dark
-      reading can produce a slightly negative ``par_tier2``. Rejecting negatives
-      would fail the dark point that the intercept is fitted from.
+    - Negative inputs are permitted. The seeded ``par_weight`` is negative on
+      NIR (and, on the superseded OLS seed, on F3, F5 and F8 as well), so a
+      legitimate dark reading can produce a slightly negative ``par_tier2``. One
+      negative coefficient is enough for that, so constraining the bands did not
+      remove the case. Rejecting negatives would fail the dark point that the
+      intercept is fitted from.
     - The reference must still rise monotonically with the applied stimulus, and
       the sweep must span a real range: an affine fit through a clustered sweep
       trades slope against intercept freely.
@@ -870,47 +947,14 @@ def assess_affine_fit(x_values, y_values, stimulus, *,
 # Reference-transfer bookkeeping
 # ============================================================================
 
-#: Assessed cost of using a MiniPAR rather than a Li-Cor Li-250A as the goal-B
-#: reference. Stored verbatim in every calibration record so a stored fit carries
-#: its own traceability caveat, and so a later Li-250A cross-check knows what it
-#: is correcting.
-#:
-#: Why the cost is small: ambit's seeded ``par_weight`` IS miniPar's fleet
-#: vector, so at a single calibration spectrum both instruments compute
-#: ``w . s`` over the same weights. Any spectral bias in ``w`` at that spectrum
-#: is common-mode and divides out of the ratio, leaving the fitted slope as
-#: (near enough) the pure optical-throughput ratio of the two stacks. The
-#: MiniPAR therefore behaves as a transfer standard, and the fit's *linearity*
-#: is unaffected - which is why the QC gates above still mean what they say.
-#:
-#: What it costs: a pure multiplicative bias equal to the reference MiniPAR's own
-#: PAR error at the calibration lamp's spectrum. In-domain that is ~2% median
-#: (plan 7c: R^2 0.9983, median |err| 1.96% over 462 samples); a halogen bench
-#: lamp is *not* in miniPar's daylight-dominated calibration set, so plan section
-#: 2's cross-source figures are the honest ones - 4.37% median, 9.82% worst
-#: device. Against the ~5% absolute accuracy of a Li-250A itself, the total goes
-#: from ~5% to ~7% in quadrature, ~10% worst case.
-#:
-#: Why it is recoverable: because the record stores ``par_tier2`` per point, a
-#: single later Li-250A comparison yields a scale correction applicable to every
-#: stored sweep without re-running any bench work.
-REFERENCE_TRANSFER_NOTE = {
-    "reference": "miniPAR (Par_REF), AS7341, accepted in place of a Li-Cor Li-250A",
-    "mechanism": "ambit's seeded par_weight is miniPar's fleet vector, so at one "
-                 "spectrum both devices compute w.s over the same weights; the "
-                 "spectral bias is common-mode and cancels into the fitted slope",
-    "cost": "multiplicative bias equal to the reference MiniPAR's own PAR error at "
-            "the calibration spectrum; linearity and therefore the QC gates are "
-            "unaffected",
-    "expected_bias_median": 0.044,
-    "expected_bias_worst": 0.098,
-    "basis": "AMBIT_COMMAND35_SPECPAR.md section 2 (leave-one-device-out, "
-             "LED-calibrated scored on daylight) and section 7c (in-domain 1.96%)",
-    "li250a_absolute_accuracy": 0.05,
-    "combined_typical": 0.07,
-    "recoverable": "par_tier2 is stored per sweep point, so one later Li-250A "
-                   "comparison yields a scale correction for every stored sweep",
-}
+# The assessed cost of using a MiniPAR rather than a Li-Cor Li-250A used to live
+# here as REFERENCE_TRANSFER_NOTE and was copied verbatim into every calibration
+# record (twice - once under the fit, once under the reference). It was the same
+# fixed prose in every payload, so it is documentation, not data: the argument and
+# its figures are in the README under "The MiniPAR as reference instead of a
+# Li-250A". What each record still carries is what is actually per-run and what a
+# later Li-250A cross-check needs - the reference's identity, its settings, its
+# own slope/intercept, and `par_tier2` per sweep point.
 
 
 def spectral_drift(spectra):

@@ -1,12 +1,15 @@
 """Calibratron runner - cmd-35 three-tier PAR chain.
 
 One pass over one Ambit: flash the approved firmware, name it, calibrate the
-tier-3 PAR parameters and the actinic LED against the bench references, measure
-the ADPD dark baseline, store the result locally and publish it to openJII.
+tier-3 PAR parameters and the actinic LED against the bench references, store
+the result locally and publish it to openJII.
 
 Designed to be run back to back while Ambits are swapped and the rest of the
-bench stays plugged in, so it asks the operator one question - the name printed
-on the device - plus one confirmation for the dark fixture.
+bench stays plugged in, so it asks the operator exactly one question - the name
+printed on the device. The ADPD dark baseline is off by default: it is the only
+step that needs a fixture change mid-run, and it calibrates nothing on the PAR
+chain, so it does not belong in an unattended back-to-back pass. Set
+``CALIBRATE_ADPD_BASELINE = True`` to bring it back.
 
 The bench needs:
   - a Kiprim DC source              -> answers "KIPRIM"   to "*IDN?"
@@ -72,26 +75,61 @@ PAR_CONFIRM_CURRENTS = [0.8, 3.0, 6.6]
 
 LED_CAL_SETTINGS = [10, 20, 60, 90, 150, 250, 0]
 
-#: Record the ADPD photodiodes (leaf, sun, s_630, r_630, env) at every point of
+#: Measure the ADPD photodiodes (leaf, sun, s_630, r_630, env) at every point of
 #: both sweeps. Not a calibration - nothing is fitted or written from these - but
 #: the tier-3 sweep pairs them with a calibrated PAR reference across the whole
 #: lamp range, which is a PAR response curve for the leaf and sun photodiodes
 #: obtained for free. The ADPD pulse LEDs are zeroed before every trace so the
-#: detector sees only the incident light.
+#: detector sees only the incident light. Only the per-point *statistics* reach
+#: the record (n, mean, sd, min, max, saturated) - the raw pulse samples are
+#: reduced and discarded.
 RECORD_ADPD_TRACES = True
+
+#: Which ADPD photodiode faces the light source in each sweep. `leaf` and `sun`
+#: point in different directions, so this is fixture geometry, not detector
+#: health: the halogen lamp reaches `sun`, the Ambit's own actinic LED reaches
+#: `leaf`. Only the named channel gets flatness / monotonicity notes; the other
+#: is still recorded, and saturation is still reported for both.
+TIER3_ADPD_RESPONDERS = ("sun",)
+LED_ADPD_RESPONDERS   = ("leaf",)
 ARRUN_PULSES  = 5      # samples per trace
 ARRUN_FREQ_HZ = 10     # sampling rate within one trace -> ~0.5 s per point
 
 LAMP_SETTLE_S = 1.0            # after changing the DC source
 LED_SETTLE_S  = 0.2
 
+#: The firmware drives the actinic only for settings > 3 (``if (actinic > 3)`` in
+#: ``run_arr_type1``, ambit/src/PAM.cpp), so no response is expected at or below
+#: it and a dark reading there is correct, not a failed latch.
+LED_OFF_MAX_SETTING = 3
+
+#: How many times to re-assert a latch the reference says did not take.
+LED_LATCH_ATTEMPTS = 3
+
+#: What counts as the reference seeing the LED: umol m-2 s-1 above the measured
+#: dark floor, or this fraction of it, whichever is larger. Calibrated against
+#: the 2026-08-18 failure, which read 5.91 dark and 217 lit - the bar only has to
+#: clear the reference's own noise, not resolve the dimmest setting.
+LED_MIN_RESPONSE = 2.0
+LED_MIN_RESPONSE_FRACTION = 0.25
+
+#: Refuse to run unless every bench instrument answered. A missing role used to
+#: degrade quietly - "[skip] tier-3 PAR calibration - missing: Kiprim DC source"
+#: still produced a saved, uploaded record - and the operator, who can see the
+#: instrument sitting there powered and cabled, has to notice a line of skip text
+#: to know the run was worthless. Discovery failing is a bench fault, so it stops
+#: the bench. Set False only to calibrate deliberately without an instrument.
+REQUIRE_ALL_DEVICES = True
+
 UPLOAD_COEFFICIENTS = True     # False -> preview every fit, write nothing
 RENAME_AMBIT        = True
 CALIBRATE_TIER3     = True
 CALIBRATE_LED       = True
-CALIBRATE_ADPD_BASELINE = True
+#: Off by default. See the module docstring: it is the one step that needs the
+#: operator to change the fixture, and it writes nothing on the PAR chain.
+CALIBRATE_ADPD_BASELINE = False
 
-FLASH_FIRMWARE           = True
+FLASH_FIRMWARE           = False
 FORCE_FLASH_FIRMWARE     = False   # True -> reflash, or recover an unresponsive device
 ALLOW_FIRMWARE_DOWNGRADE = False   # separate explicit override; normally never
 
@@ -157,6 +195,52 @@ def flash_firmware(*, force=False, current_version=None, allow_downgrade=False):
     return 0, provenance
 
 
+def _adpd_trace_meta(arrun):
+    """The per-trace facts worth keeping once the samples are dropped.
+
+    ``pulse_currents_zeroed`` is the one that must not be lost: firmware that
+    answers ``set_currents`` with BAD COMMAND leaves the ADPD pulse LEDs driving
+    during the trace, so `leaf` / `sun` stop being a measurement of the incident
+    light. Reduced statistics look exactly the same either way, which is why the
+    flag travels beside them rather than inside the samples that were discarded.
+    """
+    if not arrun:
+        return None
+    return {k: arrun.get(k) for k in ("actinic", "num_points", "freq_hz",
+                                      "pulse_currents_zeroed", "truncated")}
+
+
+def _pulse_leds_confirmed(*records):
+    """Did every recorded trace confirm zeroed pulse LEDs? None if none ran."""
+    flags = [meta["pulse_currents_zeroed"]
+             for record in records if record
+             for meta in _iter_trace_meta(record)]
+    return all(flags) if flags else None
+
+
+def _iter_trace_meta(record):
+    """Every ``adpd_trace`` block in a sweep record, whichever sweep it is."""
+    for point in record.get("sweep") or []:
+        if point.get("adpd_trace"):
+            yield point["adpd_trace"]
+    for meta in record.get("adpd_trace") or []:
+        if meta:
+            yield meta
+
+
+def _warn_if_pulse_leds_live(record, tag):
+    """Say once, next to the table, that the numbers above include the pulse LEDs.
+
+    The device reports this per trace. Six repeated `unexpected set_currents echo`
+    warnings say the command failed but not what it costs the numbers, and the
+    reduced statistics look identical either way.
+    """
+    if _pulse_leds_confirmed(record) is False:
+        print(f"[{tag}] the device did NOT confirm zeroed ADPD pulse LEDs "
+              f"(set_currents rejected), so leaf/sun above include light from the "
+              f"Ambit's own pulse LEDs - treat them as contaminated")
+
+
 def _print_adpd_table(summaries, level_label, levels):
     """One row per sweep point with the ADPD channel statistics.
 
@@ -181,6 +265,12 @@ def _print_adpd_table(summaries, level_label, levels):
         print(f"{level:>10} | " + " | ".join(cells))
     print(f"({ARRUN_PULSES} pulses per point at {ARRUN_FREQ_HZ} Hz; mean +- sd; "
           f"! = pinned at full scale)")
+    # env is the MLX object temperature, sampled once per trace rather than once
+    # per pulse, so its +-0.0 is arithmetic on one value - and the object cannot
+    # warm measurably inside a 0.5 s trace anyway. Said here so the zero is not
+    # read as an unusually quiet photodiode.
+    print("(env is the MLX object temperature: one value per trace, so +-0.0 is "
+          "expected)")
 
 
 # ============================================================================
@@ -212,8 +302,10 @@ def _read_sweep_point(link, port_ref, current, *, adpd=RECORD_ADPD_TRACES):
         "ref_spec_minipar_order": (ref_spec or {}).get("counts"),
         "ref_spec_ambit_order": helpers.minipar_to_ambit_order((ref_spec or {}).get("counts")),
         "ambit": reading.to_dict(),
-        "adpd": arrun,
+        # Only the reduction plus the trace's own provenance is kept. The raw
+        # pulse samples are ~300 B per point and nothing downstream reads them.
         "adpd_stats": quality.summarize_arrun(arrun),
+        "adpd_trace": _adpd_trace_meta(arrun),
         "usable": usable,
         "rejected_because": reasons,
     }
@@ -237,7 +329,6 @@ def calibrate_tier3(port_ambit, port_ref, port_dc, *,
         "kind": "tier3_par",
         "reference": reference,
         "seed_generation": spec_cal.SEED_GENERATION,
-        "transfer_note": dict(spec_cal.REFERENCE_TRANSFER_NOTE),
         "uploaded": False,
     }
 
@@ -296,16 +387,27 @@ def calibrate_tier3(port_ambit, port_ref, port_dc, *,
             return record
 
         # ---- the sweep ---------------------------------------------------
+        # The lamp is driven here, so the shutdown lives in `finally`: an
+        # exception on any point must not leave the fixture lit.
         points = []
-        for current in currents:
-            helpers.set_current(port_dc, current)
-            time.sleep(LAMP_SETTLE_S)
-            point, reading = _read_sweep_point(link, port_ref, current)
-            points.append(point)
-            flag = "" if point["usable"] else f"   REJECTED: {'; '.join(point['rejected_because'])}"
-            print(f"[tier3]   {current:4.1f} A   par_tier2={reading.par_tier2:10.3f}   "
-                  f"ref={point['ref_par']:8.2f}{flag}")
-        helpers.set_current(port_dc, 0.0)
+        try:
+            for current in currents:
+                helpers.set_current(port_dc, current)
+                time.sleep(LAMP_SETTLE_S)
+                point, reading = _read_sweep_point(link, port_ref, current)
+                points.append(point)
+                flag = "" if point["usable"] else f"   REJECTED: {'; '.join(point['rejected_because'])}"
+                print(f"[tier3]   {current:4.1f} A   par_tier2={reading.par_tier2:10.3f}   "
+                      f"ref={point['ref_par']:8.2f}{flag}")
+        except helpers.ReferenceUnavailable as exc:
+            # Nothing is written on this path: a partial sweep against a
+            # reference that stopped answering is not a calibration.
+            print(f"[tier3] ABORT - {exc}")
+            record["sweep"] = points
+            record["status"] = "reference_unavailable"
+            return record
+        finally:
+            helpers.set_current(port_dc, 0.0)
 
     record["sweep"] = points
     record["spectral_drift"] = spec_cal.spectral_drift(
@@ -315,10 +417,12 @@ def calibrate_tier3(port_ambit, port_ref, port_dc, *,
         # Reported, never a gate: these traces are for later analysis, so a flat
         # or pinned photodiode must not discard an otherwise good tier-3 fit.
         record["adpd_sweep"] = quality.assess_adpd_sweep(
-            [p["adpd_stats"] for p in points], [p["current_A"] for p in points])
+            [p["adpd_stats"] for p in points], [p["current_A"] for p in points],
+            responders=TIER3_ADPD_RESPONDERS)
         print("\n[tier3] ADPD photodiodes vs lamp current (actinic off):")
         _print_adpd_table([p["adpd_stats"] for p in points], "lamp A",
                           [p["current_A"] for p in points])
+        _warn_if_pulse_leds_live(record, "tier3")
         for channel, summary in record["adpd_sweep"].items():
             for note in summary.get("notes", []):
                 print(f"[tier3]   {channel}: {note}")
@@ -328,20 +432,23 @@ def calibrate_tier3(port_ambit, port_ref, port_dc, *,
     if len(usable) < len(points):
         print(f"[tier3] {len(points) - len(usable)} of {len(points)} points rejected")
 
-    quality = spec_cal.assess_affine_fit(
+    # Named `fit`, not `quality`: `quality` is the module this function calls for
+    # the ADPD table above, and binding it locally here made that call an
+    # UnboundLocalError at the *top* of the function - after a full sweep.
+    fit = spec_cal.assess_affine_fit(
         [p["ambit"]["par_tier2"] for p in usable],
         [p["ref_par"] for p in usable],
         [p["current_A"] for p in usable],
     )
-    record["fit"] = quality
-    print(f"[tier3] fit: par_slope={quality['par_slope']:.6g}  "
-          f"par_intercept={quality['par_intercept']:.6g}  "
-          f"R^2={quality['r2']:.6f}  NRMSE={quality['nrmse']:.4f}")
-    for note in quality["notes"]:
+    record["fit"] = fit
+    print(f"[tier3] fit: par_slope={fit['par_slope']:.6g}  "
+          f"par_intercept={fit['par_intercept']:.6g}  "
+          f"R^2={fit['r2']:.6f}  NRMSE={fit['nrmse']:.4f}")
+    for note in fit["notes"]:
         print(f"[tier3]   note: {note}")
 
-    if not quality["passed"]:
-        print("[tier3] REJECTED; existing tier 3 kept: " + "; ".join(quality["reasons"]))
+    if not fit["passed"]:
+        print("[tier3] REJECTED; existing tier 3 kept: " + "; ".join(fit["reasons"]))
         record["status"] = "rejected"
         return record
     if not upload:
@@ -352,7 +459,7 @@ def calibrate_tier3(port_ambit, port_ref, port_dc, *,
     # ---- write and verify --------------------------------------------------
     verified = helpers.write_tier3_with_readback(
         port_ambit,
-        par_slope=quality["par_slope"], par_intercept=quality["par_intercept"],
+        par_slope=fit["par_slope"], par_intercept=fit["par_intercept"],
         previous=before.tier3(),
     )
     record["spec_cal_after"] = verified.to_dict()
@@ -363,18 +470,25 @@ def calibrate_tier3(port_ambit, port_ref, port_dc, *,
     # The fit says the device *should* now agree with the reference. Check it,
     # rather than inferring it from the fit residuals it was derived from.
     confirm = []
-    with helpers.AmbitLink(port_ambit) as link:
-        for current in PAR_CONFIRM_CURRENTS:
-            helpers.set_current(port_dc, current)
-            time.sleep(LAMP_SETTLE_S)
-            point, reading = _read_sweep_point(link, port_ref, current)
-            ref = point["ref_par"]
-            point["rel_error"] = (reading.par - ref) / ref if ref else None
-            confirm.append(point)
-            shown = "n/a" if point["rel_error"] is None else f"{point['rel_error']:+.2%}"
-            print(f"[tier3]   confirm {current:4.1f} A   par={reading.par:8.2f}   "
-                  f"ref={ref:8.2f}   {shown}")
-    helpers.set_current(port_dc, 0.0)
+    try:
+        with helpers.AmbitLink(port_ambit) as link:
+            for current in PAR_CONFIRM_CURRENTS:
+                helpers.set_current(port_dc, current)
+                time.sleep(LAMP_SETTLE_S)
+                point, reading = _read_sweep_point(link, port_ref, current)
+                ref = point["ref_par"]
+                point["rel_error"] = (reading.par - ref) / ref if ref else None
+                confirm.append(point)
+                shown = "n/a" if point["rel_error"] is None else f"{point['rel_error']:+.2%}"
+                print(f"[tier3]   confirm {current:4.1f} A   par={reading.par:8.2f}   "
+                      f"ref={ref:8.2f}   {shown}")
+    except helpers.ReferenceUnavailable as exc:
+        # The write already happened and was read back, so this is a lost check,
+        # not a lost calibration. Say which of the two it is.
+        print(f"[tier3] confirmation incomplete - {exc}")
+        record["confirmation_incomplete"] = str(exc)
+    finally:
+        helpers.set_current(port_dc, 0.0)
     record["confirmation"] = confirm
 
     worst = max((abs(p["rel_error"]) for p in confirm if p["rel_error"] is not None),
@@ -399,9 +513,97 @@ def calibrate_tier3(port_ambit, port_ref, port_dc, *,
 # Actinic LED
 # ============================================================================
 
+def _read_emit_reference(port_emit):
+    """The Emit_LED MiniPAR's calibrated PAR and its raw channel counts."""
+    par = helpers.get_par_MP(port_emit)
+    return float(par), (helpers.get_spec_raw_MP(port_emit) or {}).get("counts")
+
+
+def _led_reference_sweep(link, port_emit, settings, measured, ref_spec, latch,
+                         *, attempts=LED_LATCH_ATTEMPTS):
+    """Pass 1 of the LED sweep: latch each setting, read the reference.
+
+    Deliberately free of any ``arrun`` call, and that separation is the whole
+    point of splitting the sweep in two. Interleaved, the sequence per point was
+    latch -> read reference -> ADPD trace, and the ADPD trace is ``arrun2``,
+    which passes ``persist=0`` and therefore ends with ``AS_LED_OFF()``
+    (ambit/src/PAM.cpp). Relighting then depended on the next ``arrun1``
+    surviving a 10 ms-per-field parse (see :meth:`helpers.AmbitLink.set_actinic`)
+    immediately after a run that had just streamed a burst of data back.
+
+    The 2026-08-18 sweep is what that looks like when it loses: the reference saw
+    the LED at the first setting only (216.98 umol) and read the dark floor at
+    every setting after it - 5.91 six times, identical to the second decimal,
+    with the raw channels flat at [1,3,4,6,7,10,11,8,22,3]. The ADPD ``leaf``
+    channel meanwhile tracked the drive perfectly (790 -> 1148 across 0 -> 250),
+    because ``arrun2`` drives the actinic itself for the length of its own trace
+    and needs no latch. So the LED, the fixture and the settle time were all
+    fine; only the latch the reference read depends on was gone.
+
+    The fit gate then reported five simultaneous failures - non-monotonic,
+    R^2 -0.96, nRMSE, residual, intercept - which is what a gate does when the
+    regressor is a constant. None of them named the cause, so the latch is now
+    verified against the reference and re-asserted when it did not take.
+
+    :param measured: caller's list, appended in place so a mid-sweep
+        ``ReferenceUnavailable`` still leaves the caller the partial sweep
+    :return: the dark-floor record the responses were judged against
+    """
+    link.set_actinic(0)
+    time.sleep(LED_SETTLE_S)
+    dark, dark_counts = _read_emit_reference(port_emit)
+    threshold = max(LED_MIN_RESPONSE, LED_MIN_RESPONSE_FRACTION * abs(dark))
+    print(f"[LED]   dark floor ref={dark:8.2f}  (lit means above "
+          f"{dark + threshold:.2f})")
+
+    for setting in settings:
+        expect_light = setting > LED_OFF_MAX_SETTING
+        for attempt in range(1, max(1, attempts) + 1):
+            ran = link.set_actinic(setting)
+            time.sleep(LED_SETTLE_S)
+            par, counts = _read_emit_reference(port_emit)
+            lit = (par - dark) > threshold
+            if lit or not expect_light:
+                break
+            print(f"[LED]   setting {setting:4d}   ref={par:8.2f}  no response "
+                  f"above the dark floor - re-asserting the latch "
+                  f"({attempt}/{max(1, attempts)})")
+        measured.append(par)
+        ref_spec.append(counts)
+        latch.append({"setting": setting, "attempts": attempt,
+                      "run_confirmed": ran, "expected_light": expect_light,
+                      "lit": lit})
+        note = "" if (lit or not expect_light) else "   LATCH FAILED"
+        print(f"[LED]   setting {setting:4d}   ref={par:8.2f}{note}")
+
+    return {"par": dark, "counts": dark_counts, "response_threshold": threshold}
+
+
+def _led_adpd_sweep(link, settings):
+    """Pass 2 of the LED sweep: one ADPD trace per setting.
+
+    Runs after pass 1 rather than inside it. ``arrun2`` drives the actinic itself
+    for the length of its own trace, so this pass needs no latch and - now that
+    it is separate - cannot destroy the one pass 1 depends on. Here the Ambit's
+    own LED *is* the light source, so ``leaf`` and ``sun`` see what the reference
+    MiniPAR saw over the LED in pass 1.
+    """
+    arruns = [link.arrun(actinic=setting, num_points=ARRUN_PULSES,
+                         freq=ARRUN_FREQ_HZ)
+              for setting in settings]
+    link.set_actinic(0)              # park the LED off before releasing the link
+    return arruns
+
+
 def calibrate_led(port_ambit, port_emit, *, settings=LED_CAL_SETTINGS,
                   upload=UPLOAD_COEFFICIENTS, current_coeff=None):
     """Sweep the actinic LED and fit the setting against the measured PAR.
+
+    Two passes over the settings, not one: :func:`_led_reference_sweep` reads the
+    Emit_LED MiniPAR at every setting, then :func:`_led_adpd_sweep` records the
+    ADPD traces. That costs one extra pass and buys a reference sweep no
+    ``arrun2`` can darken half way through - see ``_led_reference_sweep`` for the
+    failure that motivated it.
 
     Unlike tier 3 this genuinely passes through the origin - zero drive is zero
     light, with no offset to absorb - so an origin fit is right here, and a free
@@ -413,23 +615,35 @@ def calibrate_led(port_ambit, port_emit, *, settings=LED_CAL_SETTINGS,
     step records a characterisation of the LED rather than changing how the device
     behaves. Still worth running, and worth not over-trusting.
     """
-    measured, applied, ref_spec, arruns = [], [], [], []
-    # One held-open link for the whole sweep: closing and reopening with DTR/RTS
+    measured, ref_spec, latch = [], [], []
+    dark = None
+    # One held-open link for both passes: closing and reopening with DTR/RTS
     # asserted resets the device and drops the latched LED, which is why the old
     # bench script had to order its reads so carefully.
     with helpers.AmbitLink(port_ambit) as link:
-        for setting in settings:
-            link.set_actinic(setting)
-            time.sleep(LED_SETTLE_S)
-            measured.append(helpers.get_par_MP(port_emit))
-            ref_spec.append((helpers.get_spec_raw_MP(port_emit) or {}).get("counts"))
-            # actinic=setting: here the Ambit's own LED *is* the light source, so
-            # leaf and sun see what the reference MiniPAR sees over the LED.
-            arruns.append(link.arrun(actinic=setting, num_points=ARRUN_PULSES,
-                                     freq=ARRUN_FREQ_HZ)
-                          if RECORD_ADPD_TRACES else None)
-            applied.append(setting)
-            print(f"[LED]   setting {setting:4d}   ref={measured[-1]:8.2f}")
+        try:
+            dark = _led_reference_sweep(link, port_emit, settings,
+                                        measured, ref_spec, latch)
+        except helpers.ReferenceUnavailable as exc:
+            # Closing the link below drops the latched LED, so there is
+            # nothing to switch off here - only a record to keep honest.
+            print(f"[LED] ABORT - {exc}")
+            return {"kind": "actinic_led", "status": "reference_unavailable",
+                    "reason": str(exc),
+                    "led_settings": list(settings[:len(measured)]),
+                    "ref_par": [float(v) for v in measured],
+                    "latch": latch, "dark_reference": dark,
+                    "act_led_coeff_before": current_coeff, "uploaded": False}
+        arruns = (_led_adpd_sweep(link, settings) if RECORD_ADPD_TRACES
+                  else [None] * len(settings))
+
+    unlatched = [e["setting"] for e in latch if e["expected_light"] and not e["lit"]]
+    if unlatched:
+        # Said before the fit, because the fit's five simultaneous failures
+        # describe a constant regressor and say nothing about why it was constant.
+        print(f"[LED] the reference saw no light at settings {unlatched} - the "
+              f"actinic latch did not hold there, so the fit below is measuring "
+              f"the dark floor, not the LED")
 
     adpd_stats = [quality.summarize_arrun(a) for a in arruns]
     fit = quality.assess_led_fit(measured, settings)
@@ -438,17 +652,22 @@ def calibrate_led(port_ambit, port_emit, *, settings=LED_CAL_SETTINGS,
         "led_settings": list(settings),
         "ref_par": [float(v) for v in measured],
         "ref_spec_minipar_order": ref_spec,
-        "adpd": arruns,
         "adpd_stats": adpd_stats,
-        "adpd_sweep": (quality.assess_adpd_sweep(adpd_stats, settings)
+        "adpd_trace": [_adpd_trace_meta(a) for a in arruns],
+        "adpd_sweep": (quality.assess_adpd_sweep(adpd_stats, settings,
+                                                 responders=LED_ADPD_RESPONDERS)
                        if any(adpd_stats) else None),
         "fit": fit,
+        "latch": latch,
+        "latch_failed_at": unlatched,
+        "dark_reference": dark,
         "act_led_coeff_before": current_coeff,
         "uploaded": False,
     }
     if any(adpd_stats):
         print("\n[LED] ADPD photodiodes vs actinic setting:")
         _print_adpd_table(adpd_stats, "actinic", settings)
+        _warn_if_pulse_leds_live(record, "LED")
         for channel, summary in (record["adpd_sweep"] or {}).items():
             for note in summary.get("notes", []):
                 print(f"[LED]   {channel}: {note}")
@@ -531,12 +750,34 @@ def calibrate_adpd_baseline(port_ambit, previous, *, upload=UPLOAD_COEFFICIENTS,
 # Runner
 # ============================================================================
 
+#: Printed instead of running. Names the ports that answered as well as the ones
+#: that did not: "dc missing" and "dc answered on a port you did not expect" look
+#: the same to an operator reading one line of output.
+ABORT_MISSING_DEVICES = """
+[abort] no port answered for: {missing}
+        found: {found}
+        Any "Cannot open ..." warnings above name ports that are present but
+        unopenable - usually another process still holding one, or a USB bridge
+        that needs re-plugging. Instruments answer on whatever port Windows
+        gave them, so a port that moved is normal; a port that will not open is
+        not.
+        Set REQUIRE_ALL_DEVICES = False to run without them anyway."""
+
+
 def main():
     # 1. Find everything on the bus in one pass, cached ports first.
     t0 = time.perf_counter()
     ports = helpers.discover_roles(helpers.DEVICE_SPECS)
     print(f"[discover] {time.perf_counter() - t0:.2f}s  "
           + "  ".join(f"{r}={p or '-'}" for r, p in ports.items()))
+
+    missing = [role for role, port in sorted(ports.items()) if port is None]
+    if missing and REQUIRE_ALL_DEVICES:
+        # Before the reboot dump and before the rename prompt: nothing has been
+        # touched yet, so this is a clean stop rather than a half-run.
+        found = ", ".join(f"{r}={p}" for r, p in sorted(ports.items()) if p)
+        raise SystemExit(ABORT_MISSING_DEVICES.format(
+            missing=", ".join(missing), found=found or "nothing"))
 
     port_ambit = ports["ambit"]
     if port_ambit is None:
@@ -581,8 +822,13 @@ def main():
         helpers.set_ambit_name(port_ambit, new_name)
         print(f"[name] {current_name!r} -> {new_name!r}")
 
-    # 5. The reference MiniPAR's settings define the PAR tier 3 is anchored to.
+    # 5. Both MiniPARs are snapshotted, not just Par_REF. The Emit_LED unit is
+    #    the sole reference behind act_led_coeff, so its coefficients and its own
+    #    slope/intercept decide what that number means - and either unit can be
+    #    recalibrated between runs, which is exactly what makes the snapshot worth
+    #    storing per run rather than assuming.
     reference = helpers.read_minipar_reference(port_ref) if port_ref else None
+    reference_emit = helpers.read_minipar_reference(port_emit) if port_emit else None
 
     # 6. Tier-3 PAR calibration.
     tier3_cal = None
@@ -635,12 +881,20 @@ def main():
             "firmware_as_received": fw_asreceived,
             "firmware_release_provenance": provenance,
             "par_reference": reference,
+            "led_reference": reference_emit,
             "spec_cal_final": final_cal.to_dict() if final_cal else None,
             "ambit_spec_channels": list(spec_cal.CHANNELS),
             "seed_generation": spec_cal.SEED_GENERATION,
             "adpd_traces": ({"channels": list(quality.ARRUN_CHANNELS),
                              "pulses": ARRUN_PULSES, "freq_hz": ARRUN_FREQ_HZ,
-                             "pulse_leds": "zeroed before every trace",
+                             "pulse_leds": "zeroing requested before every trace",
+                             # Requested is not done: firmware that rejects
+                             # set_currents leaves them driving, and then leaf/sun
+                             # are contaminated. Report what the device confirmed.
+                             "pulse_leds_zeroed_confirmed":
+                                 _pulse_leds_confirmed(tier3_cal, led_cal),
+                             "stored": "per-point statistics and trace provenance "
+                                       "only; raw pulse samples are discarded",
                              "purpose": "recorded for later analysis; nothing is "
                                         "fitted or written from them"}
                             if RECORD_ADPD_TRACES else None),

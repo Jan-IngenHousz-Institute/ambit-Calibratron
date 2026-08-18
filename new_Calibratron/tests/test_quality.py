@@ -214,3 +214,53 @@ def test_adpd_predicate_mirrors_the_firmware():
     assert quality.valid_adpd_baseline([400, 0, 0, 0, 0, quality.MAX_ADPD_BASELINE])
     assert not quality.valid_adpd_baseline([401, 0, 0, 0, 0, 0])
     assert not quality.valid_adpd_baseline([0, 0, 0, 0, 0])
+
+
+# ============================================================================
+# assess_adpd_sweep: which channel is supposed to respond
+# ============================================================================
+
+def _flat(n=5, mean=660.0):
+    return {"n": n, "mean": mean, "std": 2.0, "min": mean - 3, "max": mean + 3,
+            "saturated": False}
+
+
+def _ramp(mean):
+    return {"n": 5, "mean": mean, "std": 2.0, "min": mean - 3, "max": mean + 3,
+            "saturated": False}
+
+
+def test_a_channel_aimed_elsewhere_is_not_reported_as_a_fault():
+    # LED sweep geometry: leaf faces the actinic LED, sun does not. Real numbers
+    # from a bench run - sun wanders 651..656 with no relation to the drive.
+    summaries = [{"leaf": _ramp(m), "sun": _flat(mean=s)}
+                 for m, s in zip([798, 810, 860, 902, 988, 1134],
+                                 [651.0, 653.2, 652.6, 655.2, 655.8, 656.4])]
+    report = quality.assess_adpd_sweep(summaries, [10, 20, 60, 90, 150, 250],
+                                       responders=("leaf",))
+    assert report["leaf"]["notes"] == []
+    assert report["sun"]["notes"] == []                  # reported, not flagged
+    assert report["sun"]["expected_to_respond"] is False
+    assert report["sun"]["span"] > 0                     # the numbers still travel
+
+
+def test_the_facing_channel_is_still_held_to_account():
+    summaries = [{"leaf": _flat(mean=800.0)} for _ in range(5)]
+    report = quality.assess_adpd_sweep(summaries, [10, 20, 60, 90, 150],
+                                       channels=("leaf",), responders=("leaf",))
+    assert "no response across the sweep" in report["leaf"]["notes"][0]
+
+
+def test_saturation_is_flagged_wherever_the_channel_points():
+    pinned = dict(_flat(), saturated=True)
+    summaries = [{"sun": pinned}, {"sun": pinned}]
+    report = quality.assess_adpd_sweep(summaries, [10, 20], channels=("sun",),
+                                       responders=("leaf",))
+    assert any("pinned at full scale" in n for n in report["sun"]["notes"])
+
+
+def test_default_still_expects_every_named_channel_to_respond():
+    summaries = [{"leaf": _flat(mean=800.0)} for _ in range(4)]
+    report = quality.assess_adpd_sweep(summaries, [1, 2, 3, 4], channels=("leaf",))
+    assert report["leaf"]["expected_to_respond"] is True
+    assert report["leaf"]["notes"]

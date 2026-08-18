@@ -24,7 +24,7 @@ Run: `python run_calibratron.py`  ·  Test: `python -m pytest tests -q`
 |---|---|---|
 | `spec_offset[10]` | ams workbook — device-independent | reads back, verifies |
 | `spec_sens[10]` | miniPar LR1-B seed (plan §7b) | reads back, records |
-| `par_weight[10]` | miniPar Li-250A fleet seed (plan §7c) | reads back, records |
+| `par_weight[10]` | miniPar Li-250A fleet seed, constrained fit (plan §7c) | reads back, records |
 | **`par_slope`** | **per-device intensity sweep** | **fits, writes, verifies** |
 | **`par_intercept`** | **same sweep** | **fits, writes, verifies** |
 
@@ -93,9 +93,9 @@ origin model was wrong, so it rejects. Tier 3's intercept is a **deliverable**,
 so that logic inverts: the thing being measured becomes grounds for rejection.
 
 The deeper cost is what origin-forcing does to the numbers. With a true
-`b = 7.983` (plan §7c measures exactly this — 2.40 µmol of dark-offset term plus
-5.61 µmol of miniPar's discarded tier-2 intercept), forcing through the origin
-folds the offset into the slope. At the bright end that is a sub-1 % error; at
+`b = 7.983` — the value plan §7c measured on the superseded OLS seed, 2.40 µmol
+of dark-offset term plus 5.61 µmol of miniPar's discarded tier-2 intercept —
+forcing through the origin folds the offset into the slope. At the bright end that is a sub-1 % error; at
 120 tier-2 counts it is over 5 %, and it keeps growing as the light drops. **A
 constant additive error becomes a proportional one, worst exactly where canopy
 and shade measurements live.** `tests/test_spec_cal.py::test_origin_forcing_would_misplace_a_real_intercept`
@@ -104,7 +104,7 @@ pins that.
 Two further incompatibilities: R² scored against the origin-forced prediction
 gates on "did `b` happen to be small" rather than on linearity; and the
 non-negativity check rejects a legitimately slightly-negative `par_tier2` at the
-dark point, which the seeded `par_weight` (negative on F3, F5, F8, NIR) can
+dark point, which the seeded `par_weight` (negative on NIR) can
 produce. That is the one point the intercept is fitted from.
 
 So `spec_cal.assess_affine_fit` fits both parameters, bounds-checks them against
@@ -204,8 +204,9 @@ Two caveats the record captures rather than hides:
 Found while checking the plan against the sweep design; now written into plan §7c.
 
 Plan §7c justifies reusing miniPar's `par_weight` at all by showing that ambit's
-extra offset subtraction costs a *constant* `Σ wᵢ·offsetᵢ` = 2.40 µmol, which
-tier 3's intercept absorbs exactly. **That constancy holds only while no channel
+extra offset subtraction costs a *constant* `Σ wᵢ·offsetᵢ` — 1.09 µmol on the
+current seed, 2.40 on the superseded OLS one — which tier 3's intercept absorbs
+exactly. **That constancy holds only while no channel
 is clipped.** Once `s` saturates at zero the offset term stops being constant and
 the relation stops being affine — and the clip is the chain's only nonlinearity
 (§5).
@@ -226,6 +227,40 @@ So `spec_cal.usable_for_fit` rejects any clipped point at any lamp drive, and th
 sweep gained a 0.4 A step: 0.0 A stays as the cheapest light-tightness check, and
 0.4 A is a genuine low anchor inside the linear regime. If the dark point comes
 back unclipped it is fitted too — the rule keys on `clip_mask`, not on the drive.
+
+## The `par_weight` seed has a generation, and it changed
+
+`SEED_PAR_WEIGHT` is the **constrained** miniPar fleet fit — `lsq_linear` on
+basic counts with `F1–F8 ≥ 0` and Clear/NIR free, shrunk toward `W_TARGET` at
+λ=0.03, exported by `miniPar/new_calibration_miniPAR/par_coeffs_fleet.json`.
+`SEED_GENERATION` is `minipar-2026-08-18-constrained`.
+
+It replaced a plain OLS fit on the same 462 samples. That one predicted in-domain
+PAR just as well (in-sample R² 0.9984 against 0.9982) but its signs were not
+physical — negative on F3, F5 and F8, positive on Clear — because the design
+matrix has condition number ≈ 451 on a daylight-dominated set. The practical cost
+is leverage on spectral shape rather than in-domain error: L1 norm 1172 against
+457 for a 1.8× larger net response, and off-daylight it shows up directly —
+canopy PAR spread 6.2 % against 0.4 %, coefficient direction spread p95 62° against 8°.
+
+Two things follow for this script:
+
+- **A tier-3 fit is only interpretable against the tier-2 vector it sat on.** The
+  two vectors give tier-2 values within 5–8 % of each other on the bench lamp, so
+  a re-swept `par_slope` moves by about that much and no gate would notice. Every
+  record therefore carries `seed_generation` *and* `par_weight_generation`.
+- **A device on older firmware must be named, not called unknown.** A `False` in
+  `seed_match` means "someone wrote a fitted vector here" everywhere else, so
+  `SUPERSEDED_PAR_WEIGHTS` keeps the previous vector and
+  `SpecCal.par_weight_generation()` reports `minipar-2026-08-17-ols` for it.
+  `read_par_provisional` adds a reason saying to reflash before trusting a fit
+  taken on it.
+
+`spec_sens` and `spec_offset` were already bit-for-bit the current
+`spectral_coeffs_fleet.json` export and did not change. `bit8` stays clear: this
+is still a fit on miniPar optics, not an ambit one. And the export still carries
+`prior_is_placeholder: true`, so expect one more generation once the CM weights
+are computed.
 
 ## How this host reads the flags word
 
@@ -293,6 +328,115 @@ the wire so the host can reproduce every derived field, and a single comparison
 covers all four footguns in plan §8 — each of which is otherwise invisible at the
 pinned exposure. If it fails, the run stops before the fit, because a fit taken
 on wrong arithmetic would encode the bug as a calibration coefficient.
+
+## Every MiniPAR read is a coin flip unless the port is opened cold
+
+The MiniPARs are ESP32-class boards with reset wired to DTR/RTS, so pyserial's
+default open — which asserts both — reboots the instrument. The command then goes
+into a booting device and the reply is one of:
+
+```
+Saved PC:0x40053b60          bootloader output
+load:0x3fcd5810,len:0x438    bootloader output
+error:unknown_command        the command line, chewed up by the reset
+17.056                       the previous question's answer, still buffered
+```
+
+Only the last one is dangerous: it parses. A stale `par` reading pairs the wrong
+reference with the Ambit's `par_tier2`, and the fit absorbs it silently.
+
+So `helpers._query` opens cold (`open_serial_no_reset`, DTR/RTS set *before*
+open), drops whatever is already buffered, skips bootloader lines without
+spending an attempt, and re-asks up to `QUERY_ATTEMPTS` times whenever the reply
+is an `error:` or the wrong *shape* for the question — every getter passes what
+shape it expects. `_command` is deliberately left on the default open: its only
+user is the Kiprim DC source, which has no reset on those pins and may hold its
+output until DTR is asserted.
+
+A reference that still will not answer raises `ReferenceUnavailable` rather than
+returning a number: the tier-3 sweep aborts with `status:
+reference_unavailable`, writes nothing, and drops the lamp to 0 A in a `finally`.
+A partial sweep against a silent reference is not a calibration.
+
+## BAD COMMAND: one space in a command template
+
+`set_currents` is implemented in every firmware this bench flashes
+(`ambit/src/do_command.h`, `case hash("set_currents")`, printing `Currents set to
+%d, %d, %d`). Six `BAD COMMAND` replies to it per run were not a missing verb.
+They came from the **trailing space** in `arrun1` / `arrun2`'s padding, `",
+, 
+"`.
+
+The device reads each command with `Serial_Input_Chars(choose, ":,", 200, ...)`, and
+`serial.cpp` gives that reader three relevant properties:
+
+- `:` and `,` end a token and are discarded;
+- CR/LF are skipped **without being stored** and without restarting the timer;
+- anything else is stored, and storing restarts a **200 ms** inter-character window.
+
+A space is printable, so it is stored as token byte 0 and opens that window.
+Whatever the host sends inside it joins the same token, so `set_currents,0,0,0,`
+arrives as `" set_currents"` - and `do_command()` drops any token whose first
+character fails `isalnum()`, silently. The verb is gone. Its three `0` arguments
+are then read as commands, and a digit-leading token goes through `atoi` into a
+switch with no numeric cases: `BAD COMMAND`, three times.
+
+Why the first trace of each sweep always worked: `set_actinic` sleeps 0.3 s and
+flushes, which outlasts the 200 ms window. `arrun` returned the instant it saw
+`Data sent` and did not - so traces 2..7 lost their `set_currents` and the ADPD
+pulse LEDs stayed live through the rest of the sweep.
+
+Fixed at the root (padding is now `",
+,
+"`, which stores nothing) and defended
+at the host (`AmbitLink._settle_console`, `CONSOLE_TOKEN_SETTLE_S = 0.25`, after
+every trace). `AmbitLink.text` also takes `expect=` now, which was a real fix for
+stale-line attribution but was NOT this bug - there was no acknowledgement to
+find, because the verb never reached the parser.
+
+`tests/test_console_tokenizer.py` models the reader's three rules and asserts the
+next verb survives each padded template; it also asserts the old padding fails,
+so the guard is shown to catch what it was written for.
+
+The consequence was not cosmetic: `pulse_currents_zeroed` was `False`, so `leaf`
+and `sun` in those traces measured the Ambit's own pulse LEDs alongside the
+incident light. That flag now travels beside `adpd_stats` (raw samples are
+dropped, provenance is not), the station block reports
+`pulse_leds_zeroed_confirmed` rather than asserting the intent, and one line under
+the table tells the operator the numbers are contaminated.
+
+## `leaf` and `sun` face different directions
+
+Which photodiode responds is fixture geometry, not detector health:
+
+| sweep | `leaf` | `sun` |
+|---|---|---|
+| halogen lamp, 0.0-6.6 A | span 69, wanders | **span 927, monotonic** |
+| Ambit actinic LED, 10-250 | **790 -> 1134, monotonic** | flat at ~655 |
+
+So `assess_adpd_sweep` takes `responders=` and only the channel aimed at the
+source gets the flat / non-monotonic notes - `("sun",)` for the lamp sweep,
+`("leaf",)` for the LED sweep. The other channel is still recorded, and
+saturation is still reported for both: a pinned photodiode is a fault wherever it
+points. Before this, every run reported the geometry as a fault, which is how a
+genuinely flat channel would have gone unnoticed.
+
+`env` is not a photodiode at all - it is the MLX object temperature, sampled once
+per trace rather than once per pulse. Its `+-0.0` is arithmetic on a single value,
+not an unusually quiet channel, and the object cannot warm measurably inside a
+0.5 s trace.
+
+## A missing instrument stops the bench
+
+`REQUIRE_ALL_DEVICES` (default on). A role that does not answer used to degrade
+quietly: tier 3 printed one `[skip]` line and the run still saved and uploaded a
+record. Discovery failing is a bench fault, so it now aborts before the reboot
+dump and before the rename prompt - nothing has been touched at that point.
+
+Discovery also says *why* now. A port that is present but will not open used to
+be a `logger.debug` line, which made it indistinguishable from an unplugged
+instrument; both are warnings, and the "no device for role" message lists every
+port that was actually asked.
 
 ## Status
 

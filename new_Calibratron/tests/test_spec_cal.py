@@ -354,14 +354,24 @@ def test_clip_mask_is_reproduced_in_near_darkness():
     assert spec_cal.verify_firmware_math(reading, cal)["passed"]
 
 
-def test_the_offset_term_tier3_absorbs_is_the_plans_2_40_umol():
+def test_the_offset_term_tier3_absorbs_is_constant_and_matches_the_docs():
     # Plan 7c: par_weight was fitted against basic counts with NO offset
     # subtracted, while the firmware computes s = max(0, x - spec_offset). The
     # difference is a CONSTANT that par_intercept absorbs exactly - which is the
     # entire argument for reusing miniPar's vector. Check the constant.
+    #
+    # Pinned to the value the module's own docstrings quote (1.09 umol on the
+    # constrained seed, 2.40 on the superseded OLS one). The pin is what keeps
+    # prose and constants from drifting apart across a seed generation - it broke
+    # on exactly this swap, which is the point.
     constant = math.fsum(w * o for w, o in zip(spec_cal.SEED_PAR_WEIGHT,
                                                spec_cal.SEED_SPEC_OFFSET))
-    assert constant == pytest.approx(2.40, abs=0.01)
+    assert constant == pytest.approx(1.09, abs=0.01)
+
+    superseded = math.fsum(
+        w * o for w, o in zip(spec_cal.SUPERSEDED_PAR_WEIGHTS["minipar-2026-08-17-ols"],
+                              spec_cal.SEED_SPEC_OFFSET))
+    assert superseded == pytest.approx(2.40, abs=0.01)
 
     # And it really is constant: the same shift whatever the light level, as long
     # as nothing clips.
@@ -483,8 +493,9 @@ def test_origin_forcing_would_misplace_a_real_intercept():
 
 
 def test_negative_par_tier2_at_the_dark_point_is_accepted():
-    # The seeded par_weight has negative coefficients on F3, F5, F8 and NIR, so a
-    # legitimate dark reading can come back slightly negative. Rejecting it would
+    # The seeded par_weight is negative on NIR, so a legitimate dark reading can
+    # come back slightly negative. One negative coefficient is enough - the
+    # constrained seed removed F3/F5/F8 but not this case. Rejecting it would
     # throw away the one point that constrains the intercept.
     x = [-1.4, 120.0, 380.0, 640.0, 980.0, 1450.0]
     y = [1.0 * v + 7.983 for v in x]
@@ -602,9 +613,68 @@ def test_ambit_and_minipar_orders_differ_only_in_the_last_two_slots():
 
 def test_the_shipped_seeds_satisfy_the_firmware_predicate_ranges():
     # Plan section 7e: the largest values are 72.7 (spec_sens, limit 1000) and
-    # 333.5 (par_weight, limit 1e4), so no predicate change was needed to seed.
+    # 85.9 (par_weight, limit 1e4), so no predicate change was needed to seed.
+    # The constrained seed only widened that margin - the OLS one peaked at 333.5.
     assert all(math.isfinite(v) and 0.0 <= v < 1.0 for v in spec_cal.SEED_SPEC_OFFSET)
     assert all(math.isfinite(v) and 0.0 < v <= 1000.0 for v in spec_cal.SEED_SPEC_SENS)
     assert all(math.isfinite(v) and abs(v) <= 1e4 for v in spec_cal.SEED_PAR_WEIGHT)
     assert max(spec_cal.SEED_SPEC_SENS) == pytest.approx(72.697997)
-    assert max(spec_cal.SEED_PAR_WEIGHT) == pytest.approx(333.463542)
+    assert max(spec_cal.SEED_PAR_WEIGHT) == pytest.approx(85.8748691)
+    for vector in spec_cal.SUPERSEDED_PAR_WEIGHTS.values():
+        assert all(math.isfinite(v) and abs(v) <= 1e4 for v in vector)
+
+
+def test_only_nir_carries_a_negative_par_weight():
+    """The physical sign rule, pinned so a future refit cannot quietly lose it.
+
+    The eight band channels measure light and must lift PAR; Clear and NIR are
+    broadband and appear in the model to subtract stray light and IR leakage, so
+    only they may go negative. The superseded OLS seed broke this on F3, F5 and
+    F8 - not spectral response but collinearity, condition number ~451 on a
+    daylight-dominated set. Constraining F1-F8 >= 0 is what fixed it, so the
+    constraint belongs in the test suite and not only in the fitting notebook.
+    """
+    weights = dict(zip(spec_cal.CHANNELS, spec_cal.SEED_PAR_WEIGHT))
+    bands = [name for name in spec_cal.CHANNELS if name.startswith("f")]
+    assert len(bands) == 8
+    assert all(weights[name] >= 0.0 for name in bands), \
+        {name: weights[name] for name in bands if weights[name] < 0}
+    assert weights["nir_910"] < 0.0        # IR leakage subtraction
+
+    # And the vector the constraint replaced did violate it, so this test would
+    # have caught that seed rather than passing vacuously.
+    old = dict(zip(spec_cal.CHANNELS,
+                   spec_cal.SUPERSEDED_PAR_WEIGHTS["minipar-2026-08-17-ols"]))
+    assert [name for name in bands if old[name] < 0] == ["f3_480", "f5_555", "f8_680"]
+
+
+def test_a_device_on_the_superseded_seed_is_named_not_called_unknown():
+    """A False in ``seed_match`` means "someone wrote a fitted vector here".
+
+    So after a seed bump, a device still on the previous firmware must not land
+    in that bucket - it would read as calibrated when it is merely stale. The
+    generation lookup is what keeps the two apart.
+    """
+    old = list(spec_cal.SUPERSEDED_PAR_WEIGHTS["minipar-2026-08-17-ols"])
+    stale = spec_cal.decode_spec_cal(make_spec_cal(par_weight=old))
+
+    assert stale.seed_match()["par_weight"] is False
+    assert stale.par_weight_generation() == "minipar-2026-08-17-ols"
+
+    verdict = spec_cal.read_par_provisional(None, stale)
+    assert verdict["par_weight_generation"] == "minipar-2026-08-17-ols"
+    assert any("superseded" in r for r in verdict["reasons"])
+    assert verdict["provisional"] is True
+
+
+def test_the_current_seed_and_a_fitted_vector_are_told_apart():
+    current = spec_cal.decode_spec_cal(make_spec_cal())
+    assert current.par_weight_generation() == spec_cal.SEED_GENERATION
+    assert current.to_dict()["par_weight_generation"] == spec_cal.SEED_GENERATION
+    # No "superseded" reason for a device on the current generation.
+    assert not any("superseded" in r
+                   for r in spec_cal.read_par_provisional(None, current)["reasons"])
+
+    fitted = spec_cal.decode_spec_cal(make_spec_cal(par_weight=[7.5] * 10))
+    assert fitted.par_weight_generation() is None
+    assert fitted.seed_match()["par_weight"] is False

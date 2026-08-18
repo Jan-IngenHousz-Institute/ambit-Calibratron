@@ -325,7 +325,8 @@ def summarize_arrun(arrun, channels=ARRUN_CHANNELS):
     return out
 
 
-def assess_adpd_sweep(summaries, stimulus, channels=("leaf", "sun")):
+def assess_adpd_sweep(summaries, stimulus, channels=("leaf", "sun"),
+                      responders=None):
     """Sanity-check the photodiode response across a whole sweep.
 
     Reported, never a rejection: these traces are recorded for later analysis and
@@ -333,11 +334,23 @@ def assess_adpd_sweep(summaries, stimulus, channels=("leaf", "sun")):
     something the operator should see rather than something that should discard a
     good tier-3 fit.
 
+    ``responders`` names the channels that are *supposed* to see this stimulus,
+    and only those get the flat / non-monotonic notes. `leaf` and `sun` face
+    different directions, so which one responds is a property of the fixture, not
+    of the detector: under the halogen lamp `sun` spans ~927 counts monotonically
+    while `leaf` moves ~69 and wanders; under the Ambit's own actinic LED it is
+    the reverse (`leaf` 790 -> 1153, `sun` flat at ~660). Flagging the channel
+    that is aimed elsewhere reports the geometry as a fault every single run,
+    which is how a real flat channel gets lost in the noise. Saturation is still
+    reported for every channel - a pinned photodiode is a fault wherever it points.
+
     :param summaries: per-point output of :func:`summarize_arrun`, sweep order
     :param stimulus: the drive at each point, same order
-    :param channels: which channels to comment on
+    :param channels: which channels to report on
+    :param responders: which of them face this stimulus (default: all of them)
     :return: ``{channel: {"n_points", "saturated_at", "monotonic", "span", ...}}``
     """
+    responders = tuple(channels) if responders is None else tuple(responders)
     order = sorted(range(len(stimulus)), key=lambda i: float(stimulus[i]))
     report = {}
     for channel in channels:
@@ -359,12 +372,14 @@ def assess_adpd_sweep(summaries, stimulus, channels=("leaf", "sun")):
         if saturated_at:
             notes.append(f"pinned at full scale at drive {saturated_at} - readings "
                          f"there are a floor, not a measurement")
-        if span <= 0:
-            notes.append("no response across the sweep - check the detector")
-        elif not monotonic:
-            notes.append("response is not monotonic with the drive")
+        if channel in responders:
+            if span <= 0:
+                notes.append("no response across the sweep - check the detector")
+            elif not monotonic:
+                notes.append("response is not monotonic with the drive")
         report[channel] = {
             "n_points": len(usable),
+            "expected_to_respond": channel in responders,
             "drive": [drive for drive, _s in usable],
             "mean": means,
             "span": span,
