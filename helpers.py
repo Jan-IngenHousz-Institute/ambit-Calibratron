@@ -26,6 +26,7 @@ replaces them rather than sitting alongside them:
 from __future__ import annotations
 
 import glob
+import hashlib
 import json
 import logging
 import os
@@ -1358,9 +1359,16 @@ def esptool_command():
 
 
 def read_flash_layout(firmware_dir, manifest_name="manifest.json"):
-    """Read the esptool flash layout out of a firmware folder's manifest.
+    """Read and *verify* the esptool flash layout from a folder's manifest.
 
-    The manifest's ``flash`` array is the contract with the firmware repo.
+    The manifest's ``flash`` array is the contract with the firmware repo, and
+    every image it lists is verified here against the manifest's own size and
+    sha256 before it is allowed anywhere near esptool. That check is the
+    non-negotiable half of the firmware contract: a truncated bootloader
+    written at 0x0 leaves the device dead until recovered, and a wrong
+    partition table scrambles how NVS is read. Where the folder *came from* -
+    a proven GitHub release or a local build - is provenance, recorded in the
+    calibration record but deliberately not gated here.
 
     :return: ``[(offset, filename), ...]`` ascending by offset
     """
@@ -1385,8 +1393,23 @@ def read_flash_layout(firmware_dir, manifest_name="manifest.json"):
         offset = entry.get("offset") if isinstance(entry, dict) else None
         if not name or offset is None:
             raise RuntimeError(f"{manifest_path}: 'flash' entry missing file/offset: {entry!r}")
-        if not os.path.isfile(os.path.join(firmware_dir, str(name))):
+        path = os.path.join(firmware_dir, str(name))
+        if not os.path.isfile(path):
             raise FileNotFoundError(f"{manifest_path} lists {name!r} but it is missing")
+        want_size, want_sha = entry.get("size"), entry.get("sha256")
+        if not want_size or not want_sha:
+            raise RuntimeError(f"{manifest_path}: {name!r} carries no size/sha256 - "
+                               f"the image cannot be verified before flashing")
+        if os.path.getsize(path) != want_size:
+            raise RuntimeError(f"{name}: size {os.path.getsize(path)} B disagrees "
+                               f"with the manifest's {want_size} B")
+        digest = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                digest.update(chunk)
+        if digest.hexdigest() != str(want_sha).lower():
+            raise RuntimeError(f"{name}: sha256 disagrees with the manifest - "
+                               f"the image is corrupt or was swapped")
         layout.append((str(offset), str(name)))
 
     def _offset_value(item):
@@ -1413,19 +1436,25 @@ def flash_ambit_firmware(firmware_dir, port, chip="esp32c3"):
     no separate scan for a bridge with a particular USB VID:PID, which broke
     every time the fixture shipped with a different WCH chip.
 
+    Integrity, not provenance, is what gates the flash: every image is checked
+    against the manifest's size and sha256 by :func:`read_flash_layout`, so a
+    corrupt or half-copied folder can never reach esptool. Whether the folder
+    is a *proven GitHub release* (``firmware_fetch.is_complete``) is a
+    traceability property of the calibration record - the caller decides what
+    provenance to record, and a local development build is a legitimate
+    source. The host-side gates (the firmware math check, ``seed_match``, the
+    closed-loop confirmation) independently verify the firmware's behaviour
+    during calibration either way.
+
     esptool runs with ``cwd=firmware_dir`` and bare file names, which keeps the
     command line free of the spaces that Windows bench paths are full of.
 
     :return: True once the device has been flashed
-    :raises RuntimeError: if the folder is not a verified release or if esptool
-        exits non-zero
+    :raises RuntimeError: if any image fails the manifest's size/sha256, or if
+        esptool exits non-zero
     """
     import subprocess
 
-    import firmware_fetch
-    if not firmware_fetch.is_complete(firmware_dir):
-        raise RuntimeError(f"{firmware_dir} is not a complete verified Ambit "
-                           f"release cache entry")
     layout = read_flash_layout(firmware_dir)
     logger.info("flashing via %s", port)
 
