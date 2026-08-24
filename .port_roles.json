@@ -1,0 +1,6 @@
+{
+  "ambit": "COM18",
+  "dc": "COM4",
+  "emit_led": "COM3",
+  "par_ref": "COM64"
+}

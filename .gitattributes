@@ -1,4 +1,0 @@
-# The firmware-contract fixtures are asserted byte-for-byte in
-# tests/test_firmware_fetch.py, so they must never pick up CRLF on a Windows
-# checkout (core.autocrlf=true turns 849 bytes into 883 and fails the test).
-tests/fixtures/*.json text eol=lf
