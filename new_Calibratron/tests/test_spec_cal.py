@@ -426,9 +426,10 @@ def test_a_fully_measured_device_is_not_provisional():
 
 
 def test_flags_disagreeing_with_the_vectors_is_surfaced():
-    # bit9 claims a stored tier 3 while the read-back is identity, and bit8 claims
-    # an ambit fit while par_weight is bit-for-bit the miniPar seed. Either means
+    # bit8 claims an ambit fit while par_weight is bit-for-bit the miniPar seed:
     # the bits and NVS tell different stories, which must not resolve silently.
+    # bit9 over identity is NOT part of the disagreement (see the latch test
+    # below) but still earns its informational reason.
     cal = spec_cal.decode_spec_cal(make_spec_cal(par_slope=1.0, par_intercept=0.0))
     reading = spec_cal.decode_spec_raw(make_spec_raw(
         flags=spec_cal.FLAG_PAR_WEIGHT_IS_FLEET_FIT | spec_cal.FLAG_TIER3_STORED))
@@ -437,6 +438,31 @@ def test_flags_disagreeing_with_the_vectors_is_surfaced():
     assert verdict["provisional"] is True
     assert any("bit9" in r for r in verdict["reasons"])
     assert any("bit8" in r for r in verdict["reasons"])
+
+
+def test_a_latched_bit9_over_identity_vectors_is_legal_not_a_disagreement():
+    # The firmware keys bit9 on NVS key presence and it latches for the life of
+    # the partition (AMBIT_COMMAND35_SPECPAR.md par.5a) - a bench write or a slope
+    # restored to exactly 1.0 leaves it set over identity vectors. That is a
+    # documented state the conformance unit is actually in; it must earn a
+    # reason, not abort the sweep.
+    cal = spec_cal.decode_spec_cal(make_spec_cal(par_slope=1.0, par_intercept=0.0))
+    reading = spec_cal.decode_spec_raw(make_spec_raw(flags=spec_cal.FLAG_TIER3_STORED))
+    verdict = spec_cal.read_par_provisional(reading, cal)
+    assert verdict["flag_vector_agreement"] is True
+    assert verdict["provisional"] is True
+    assert any("bit9" in r and "latch" in r for r in verdict["reasons"])
+
+
+def test_bit9_clear_over_non_identity_vectors_is_a_disagreement():
+    # The impossible direction: non-identity slope/intercept only reach NVS
+    # through setters that latch bit9, so bit9 clear over a non-identity
+    # read-back means the bits and NVS tell different stories.
+    cal = spec_cal.decode_spec_cal(make_spec_cal(par_slope=1.23, par_intercept=7.9))
+    reading = spec_cal.decode_spec_raw(make_spec_raw(flags=0))
+    verdict = spec_cal.read_par_provisional(reading, cal)
+    assert verdict["flag_vector_agreement"] is False
+    assert any("bit9" in r and "non-identity" in r for r in verdict["reasons"])
 
 
 def test_provisional_falls_back_to_the_vectors_with_no_reading():

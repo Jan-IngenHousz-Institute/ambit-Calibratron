@@ -1339,24 +1339,6 @@ def set_adpd_baseline(port, values, timeout=5.0):
 # Firmware
 # ============================================================================
 
-FLASHER_VID, FLASHER_PID = 0x1A86, 0x55D3      # WCH CH343 bridge
-FLASHER_VIDPID = "1A86:55D3"
-
-
-def flasher_ports():
-    """Serial ports that look like an Ambit flasher (WCH CH343 bridge)."""
-    found = []
-    for port in sorted(serial.tools.list_ports.comports(), key=lambda p: p.device):
-        device = getattr(port, "device", None)
-        if not device:
-            continue
-        hwid = (getattr(port, "hwid", "") or "").upper()
-        if ((getattr(port, "vid", None), getattr(port, "pid", None))
-                == (FLASHER_VID, FLASHER_PID)) or FLASHER_VIDPID in hwid:
-            found.append(device)
-    return found
-
-
 def esptool_command():
     """The argv prefix used to invoke esptool, cross-platform.
 
@@ -1417,7 +1399,7 @@ def read_flash_layout(firmware_dir, manifest_name="manifest.json"):
     return layout
 
 
-def flash_ambit_firmware(firmware_dir, port=None, chip="esp32c3"):
+def flash_ambit_firmware(firmware_dir, port, chip="esp32c3"):
     """Flash the verified images in ``firmware_dir`` with esptool.
 
     Self-contained rather than delegating to the repo-root ``helpers``: that
@@ -1425,12 +1407,18 @@ def flash_ambit_firmware(firmware_dir, port=None, chip="esp32c3"):
     resolves back to this one. Release *selection* policy still lives in
     ``firmware_fetch``; only the esptool invocation is duplicated.
 
+    ``port`` is the port the Ambit answered discovery on. On this bench the
+    Ambit talks through its flasher bridge (whose DTR/RTS drive reset/boot, see
+    :func:`open_serial_no_reset`), so a discovered Ambit is a flashable one -
+    no separate scan for a bridge with a particular USB VID:PID, which broke
+    every time the fixture shipped with a different WCH chip.
+
     esptool runs with ``cwd=firmware_dir`` and bare file names, which keeps the
     command line free of the spaces that Windows bench paths are full of.
 
     :return: True once the device has been flashed
-    :raises RuntimeError: if the folder is not a verified release, if zero or
-        several flasher ports are present, or if esptool exits non-zero
+    :raises RuntimeError: if the folder is not a verified release or if esptool
+        exits non-zero
     """
     import subprocess
 
@@ -1439,15 +1427,6 @@ def flash_ambit_firmware(firmware_dir, port=None, chip="esp32c3"):
         raise RuntimeError(f"{firmware_dir} is not a complete verified Ambit "
                            f"release cache entry")
     layout = read_flash_layout(firmware_dir)
-
-    if port is None:
-        candidates = flasher_ports()
-        if not candidates:
-            raise RuntimeError("no Ambit flasher USB device found")
-        if len(candidates) != 1:
-            raise RuntimeError(f"expected 1 flasher port, found {len(candidates)}: "
-                               f"{', '.join(candidates)}")
-        port = candidates[0]
     logger.info("flashing via %s", port)
 
     # The snake_case esptool options are the deprecated spelling in esptool v5,

@@ -129,8 +129,8 @@ CALIBRATE_LED       = True
 #: operator to change the fixture, and it writes nothing on the PAR chain.
 CALIBRATE_ADPD_BASELINE = False
 
-FLASH_FIRMWARE           = False
-FORCE_FLASH_FIRMWARE     = False   # True -> reflash, or recover an unresponsive device
+FLASH_FIRMWARE           = True
+FORCE_FLASH_FIRMWARE     = True   # True -> reflash, or recover an unresponsive device
 ALLOW_FIRMWARE_DOWNGRADE = False   # separate explicit override; normally never
 
 #: Host recompute vs firmware. A real error in the tick, the gain ordinal, the
@@ -156,8 +156,12 @@ OJII_ENDPOINT       = "a3qrmjf5m5y241-ats.iot.eu-central-1.amazonaws.com"
 # Firmware
 # ============================================================================
 
-def flash_firmware(*, force=False, current_version=None, allow_downgrade=False):
+def flash_firmware(port, *, force=False, current_version=None,
+                   allow_downgrade=False):
     """Fetch the approved release and flash only when safely authorised.
+
+    ``port`` is where the Ambit answered discovery - on this bench that is the
+    flasher bridge, so no separate flasher lookup is needed.
 
     :return: ``(rc, provenance)`` - rc 0 on success or a deliberate skip
     """
@@ -185,7 +189,7 @@ def flash_firmware(*, force=False, current_version=None, allow_downgrade=False):
 
     print(f"[flash] {decision}: {current_version!r} -> {version!r}")
     try:
-        helpers.flash_ambit_firmware(firmware_dir)
+        helpers.flash_ambit_firmware(firmware_dir, port=port)
     except (FileNotFoundError, RuntimeError) as exc:
         print(f"[flash] flashing failed: {exc}")
         return 1, provenance
@@ -802,7 +806,7 @@ def main():
         if FORCE_FLASH_FIRMWARE:
             print("WARNING: FORCE_FLASH_FIRMWARE - equivalent firmware may be "
                   "re-flashed or an unresponsive device recovered")
-        rc, provenance = flash_firmware(force=FORCE_FLASH_FIRMWARE,
+        rc, provenance = flash_firmware(port_ambit, force=FORCE_FLASH_FIRMWARE,
                                         current_version=fw_asreceived or None,
                                         allow_downgrade=ALLOW_FIRMWARE_DOWNGRADE)
         if rc != 0:

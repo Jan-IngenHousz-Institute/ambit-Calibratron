@@ -287,8 +287,13 @@ Two consequences for this script:
   the criteria are the cmd 33/4 read-back and the confirmation pass.
 - **bit9 is authoritative for "has this device been swept"**, keyed on NVS key
   presence. `read_par_provisional` still cross-checks it against the read-back
-  vectors, and **aborts the sweep if the two disagree** — a fit taken on top of
-  an unknown tier-2 state is not a calibration.
+  vectors, but the check is **directional**: bit9 latches for the life of the
+  NVS partition (there is no verb to delete the key — firmware plan §5a), so
+  bit9 set over identity vectors is a legal state (a bench write, or a slope
+  restored to exactly 1.0) that earns a printed reason and nothing more. Only
+  the impossible direction — bit9 clear over non-identity vectors — **aborts
+  the sweep**, because a fit taken on top of an unknown tier-2 state is not a
+  calibration.
 
 **The reboot dump does not contain the PAR chain.** The five vectors live outside
 `ambit_calibration_info_t` by design (decision 2), so the boot banner shows a

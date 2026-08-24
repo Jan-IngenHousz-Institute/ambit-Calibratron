@@ -598,6 +598,12 @@ def read_par_provisional(spec_raw, spec_cal):
     top of (bit8 is one bit, not a provenance record), and a firmware whose
     compile-time flag disagrees with the vectors actually in NVS.
 
+    The bit9 cross-check is directional. The firmware keys bit9 on NVS key
+    *presence* and latches it for the life of the partition (there is no verb to
+    delete the key), so bit9 set over identity vectors is a legal, documented
+    state and only earns a reason. bit9 *clear* over non-identity vectors is
+    impossible by construction and stays a disagreement.
+
     :return: ``{"provisional", "reasons", "flag_par_weight_is_fleet_fit",
         "flag_tier3_stored", "tier3_unset", "on_seeds", "flag_vector_agreement"}``
     """
@@ -632,11 +638,22 @@ def read_par_provisional(spec_raw, spec_cal):
 
     # Cross-check. A disagreement means the bits and NVS tell different stories,
     # which is worth surfacing loudly rather than silently preferring either.
+    # bit9 is directional: the firmware keys it on NVS key *presence* and it
+    # latches on (AMBIT_COMMAND35_SPECPAR.md par.5a - a slope of exactly 1.0 is a
+    # legitimate fit, and there is no verb to delete the key), so bit9 set over
+    # identity vectors is a legal state - a bench write, or a slope restored to
+    # 1.0 - not a contradiction. The reverse direction stays fatal: non-identity
+    # values only reach NVS through setters that latch bit9.
     disagreement = []
-    if flag_tier3 is not None and flag_tier3 == tier3_unset:
+    if flag_tier3 is False and not tier3_unset:
         disagreement.append(
-            f"flags bit9 says tier3_stored={flag_tier3} but the read-back tier 3 is "
-            f"{'identity' if tier3_unset else 'non-identity'}")
+            "flags bit9 says tier3_stored=False but the read-back tier 3 is "
+            "non-identity")
+    elif flag_tier3 is True and tier3_unset:
+        reasons.append(
+            "flags bit9 is set but tier 3 reads identity (1.0, 0.0) - bit9 "
+            "latches on NVS key presence, so a bench write or a restored slope "
+            "leaves it set; the sweep overwrites tier 3 either way")
     if flag_fleet is True and "par_weight" in on_seeds:
         disagreement.append("flags bit8 claims an ambit fleet fit but par_weight is "
                             "still bit-for-bit the miniPar seed")
