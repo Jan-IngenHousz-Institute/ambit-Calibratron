@@ -4,7 +4,7 @@ One window for a whole bench session: discover the instruments, run the same
 per-device pass as ``run_calibratron.main()`` (flash, name, tier-3 PAR, actinic
 LED, record, publish), and keep a table of every device calibrated since the
 window opened. Designed for back-to-back devices: swap the Ambit in the
-fixture, type the next name, press Start again.
+fixture, press Start again and answer the name prompt.
 
 What it deliberately does NOT change: all calibration logic, gates and record
 formats live in run_calibratron / helpers / spec_cal / quality and are called
@@ -19,6 +19,13 @@ Firmware can come from two places:
     provenance is not: a files-complete local build flashes fine, and the
     calibration record then carries an honest ``verified: false`` provenance
     with the per-file hashes instead of the GitHub release proof.
+
+Publishing signs in as the operator, not as a device: one openJII API key,
+pasted once and kept in %APPDATA%/Calibratron (the ambyte flash GUI's key is
+picked up when it is already there, so most benches never see the dialog).
+Sign-in state is settled before Start, never after a twenty-minute run - see
+:mod:`openjii_auth` for why an API key is the only option and why the publish
+rides temporary AWS credentials rather than an X.509 bundle.
 
 The ADPD dark baseline step is not offered: it needs a fixture change mid-run
 (see the run_calibratron module docstring) and calibrates nothing on the PAR
@@ -39,9 +46,10 @@ import sys
 import threading
 import time
 import traceback
+import webbrowser
 
 import tkinter as tk
-from tkinter import filedialog, messagebox, scrolledtext, ttk
+from tkinter import filedialog, messagebox, scrolledtext, simpledialog, ttk
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
@@ -87,6 +95,7 @@ sys.stdout = _Tee(sys.stdout)
 
 import firmware_fetch
 import helpers
+import openjii_auth
 import run_calibratron as rc
 
 
@@ -181,6 +190,9 @@ class CalibratronGUI:
         self.worker = None
         self.fw_report = None
         self.session_rows = 0
+        self.settings = openjii_auth.Settings.load()
+        #: Validated OpenJIIClient, or None while nobody is signed in.
+        self.oj_client = None
 
         self._build_left()
         self._build_right()
@@ -189,6 +201,7 @@ class CalibratronGUI:
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         root.after(100, self._drain_queue)
         self._log_line("[gui] ready - press 'Rescan bench' to discover the instruments")
+        self._sign_in_with_stored_key()
 
     # ---- layout -----------------------------------------------------------
 
@@ -246,13 +259,29 @@ class CalibratronGUI:
         self.fw_tree.grid(row=4, column=0, columnspan=3, sticky="ew")
         self._fw_mode_changed()
 
+        # openJII
+        oj = ttk.LabelFrame(left, text="openJII", padding=6)
+        oj.pack(fill="x", pady=(8, 0))
+        oj.columnconfigure(1, weight=1)
+        ttk.Label(oj, text="Environment:").grid(row=0, column=0, sticky="w")
+        self.oj_env = tk.StringVar(value=self.settings.environment)
+        env_box = ttk.Combobox(oj, textvariable=self.oj_env, width=8,
+                               state="readonly",
+                               values=list(openjii_auth.ENVIRONMENTS))
+        env_box.grid(row=0, column=1, sticky="w")
+        env_box.bind("<<ComboboxSelected>>", lambda _e: self._on_env_changed())
+        self.oj_sign_in_btn = ttk.Button(oj, text="Sign in (API key)…",
+                                         command=self.on_sign_in)
+        self.oj_sign_in_btn.grid(row=1, column=0, columnspan=2, sticky="ew",
+                                 pady=(4, 0))
+        self.oj_user = tk.StringVar(value="not signed in")
+        ttk.Label(oj, textvariable=self.oj_user, foreground="gray",
+                  wraplength=240, justify="left").grid(
+            row=2, column=0, columnspan=2, sticky="w")
+
         # Run
         run = ttk.LabelFrame(left, text="Calibrate this device", padding=6)
         run.pack(fill="x", pady=(8, 0))
-        ttk.Label(run, text="New name (blank = keep):").grid(row=0, column=0, sticky="w")
-        self.name_var = tk.StringVar(value="")
-        ttk.Entry(run, textvariable=self.name_var, width=18).grid(row=0, column=1,
-                                                                  sticky="ew")
         self.opt_flash = tk.BooleanVar(value=rc.FLASH_FIRMWARE)
         self.opt_force = tk.BooleanVar(value=rc.FORCE_FLASH_FIRMWARE)
         self.opt_tier3 = tk.BooleanVar(value=rc.CALIBRATE_TIER3)
@@ -265,12 +294,16 @@ class CalibratronGUI:
                 ("Tier-3 PAR calibration (par_slope, par_intercept)", self.opt_tier3),
                 ("Actinic LED calibration", self.opt_led),
                 ("Write coefficients to the device", self.opt_upload),
-                ("Publish the record to openJII", self.opt_publish)), start=1):
+                ("Publish the record to openJII", self.opt_publish)), start=0):
             ttk.Checkbutton(run, text=text, variable=var).grid(
                 row=i, column=0, columnspan=2, sticky="w")
         self.start_btn = ttk.Button(run, text="Start calibration",
                                     command=self.on_start)
-        self.start_btn.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        self.start_btn.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        ttk.Label(run, text="The device name is asked for once the Ambit has "
+                            "been read, at the start of the run.",
+                  wraplength=240, justify="left").grid(
+            row=7, column=0, columnspan=2, sticky="w", pady=(4, 0))
 
     def _build_right(self):
         right = ttk.Frame(self.root, padding=(0, 8, 8, 8))
@@ -395,9 +428,118 @@ class CalibratronGUI:
                     self._set_busy(payload)
                 elif kind == "error":
                     messagebox.showerror("Calibratron", payload)
+                elif kind == "ask_name":
+                    self._prompt_device_name(payload)
+                elif kind == "signed_in":
+                    self._show_signed_in(payload)
         except queue.Empty:
             pass
         self.root.after(100, self._drain_queue)
+
+    # ---- openJII sign-in ----------------------------------------------------
+
+    def _env(self):
+        return openjii_auth.environment(self.oj_env.get())
+
+    def _on_env_changed(self):
+        self.settings.environment = self.oj_env.get()
+        self.settings.save()
+        self.oj_client = None
+        self.oj_user.set("not signed in")
+        self._sign_in_with_stored_key()
+
+    def _sign_in_with_stored_key(self):
+        """Reuse a key already on this PC - this tool's, or the flash GUI's.
+
+        Same operator, same openJII account, so a bench that has signed in
+        once never sees the dialog again.
+        """
+        env = self._env()
+        key = self.settings.api_key(env.key)
+        source = "stored key"
+        if not key:
+            key = openjii_auth.flash_gui_api_key(env.key)
+            source = "the ambyte flash GUI's key"
+        if not key:
+            self._log_line(f"[openJII] not signed in to {env.key} - press "
+                           f"'Sign in (API key)…' before publishing")
+            return
+        self._log_line(f"[openJII] validating {source} for {env.key}…")
+        self._validate_key_async(key, quiet=True)
+
+    def on_sign_in(self):
+        env = self._env()
+        webbrowser.open(env.api_keys_url)
+        key = simpledialog.askstring(
+            "openJII sign-in",
+            f"A browser window opened at:\n{env.api_keys_url}\n\n"
+            f"Sign in there, create a personal API key (it is shown once),\n"
+            f"and paste it here (jii_...):",
+            initialvalue=(self.settings.api_key(env.key)
+                          or openjii_auth.flash_gui_api_key(env.key)),
+            parent=self.root)
+        if key and key.strip():
+            self._validate_key_async(key.strip())
+
+    def _validate_key_async(self, key, quiet=False):
+        """Validate off the main thread: this is a network round trip, and it
+        happens while the operator is mounting the next device."""
+        env = self._env()
+
+        def work():
+            client = openjii_auth.OpenJIIClient(env, key)
+            try:
+                client.validate_key()
+            except openjii_auth.OpenJIIError as exc:
+                if quiet:
+                    _LOG_QUEUE.put(("log", f"[openJII] {exc}\n"))
+                else:
+                    _LOG_QUEUE.put(("error", f"openJII sign-in: {exc}"))
+                return
+            _LOG_QUEUE.put(("signed_in", (client, key)))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _show_signed_in(self, payload):
+        client, key = payload
+        self.oj_client = client
+        self.settings.set_api_key(client.env.key, key)
+        self.settings.environment = client.env.key
+        self.settings.save()
+        self.oj_user.set(f"{client.env.key}: {client.who()}")
+        self._log_line(f"[openJII] signed in to {client.env.key} as "
+                       f"{client.who()}")
+
+    def _ask_device_name(self, current_name):
+        """Ask the operator what to call this Ambit; return a name or None.
+
+        Called from the worker thread: the request is queued and the worker
+        blocks until the dialog closes on the main thread. Blank input and
+        Cancel both mean "keep the current name" - no device is renamed by
+        accident, and a run never stalls on a dismissed dialog.
+        """
+        request = {"current": current_name, "answer": None,
+                   "done": threading.Event()}
+        _LOG_QUEUE.put(("ask_name", request))
+        request["done"].wait()
+        return request["answer"]
+
+    def _prompt_device_name(self, request):
+        """Main-thread half of :meth:`_ask_device_name`."""
+        current = request["current"] or "(no name set)"
+        try:
+            answer = simpledialog.askstring(
+                "Calibratron - device name",
+                f"Current name: {current}\n\n"
+                f"New name for this Ambit\n"
+                f"(leave blank to keep the current one):",
+                parent=self.root)
+            request["answer"] = (answer or "").strip() or None
+        except Exception:
+            _LOG_QUEUE.put(("log", traceback.format_exc()))
+            request["answer"] = None
+        finally:
+            request["done"].set()
 
     def _set_busy(self, busy):
         state = "disabled" if busy else "normal"
@@ -474,8 +616,34 @@ class CalibratronGUI:
                 return
             if self.fw_report is None:
                 self.on_check_folder()
+        if not self._publish_preflight():
+            return
         self._reset_device_views()
         self._spawn(self._run_device_worker, "calibrating…")
+
+    def _publish_preflight(self):
+        """Settle publishing before the run, not after it.
+
+        An unauthenticated upload used to surface as a warning at the end of a
+        twenty-minute calibration, with the operator already unplugging the
+        device. :return: True to go ahead.
+        """
+        if not self.opt_publish.get() or self.oj_client is not None:
+            return True
+        if messagebox.askyesno(
+                "Calibratron",
+                "Publishing to openJII is on, but nobody is signed in.\n\n"
+                "Sign in now? (No = run this device without publishing; "
+                "the record is still saved to disk.)"):
+            self.on_sign_in()
+            # Validation is a network round trip on its own thread, so the
+            # client is not up yet: let the operator press Start again rather
+            # than blocking the window on it.
+            return False
+        self.opt_publish.set(False)
+        self._log_line("[openJII] publishing turned off for this run - "
+                       "not signed in")
+        return True
 
     def _reset_device_views(self):
         for var in (*self.par_vars.values(), *self.led_vars.values()):
@@ -561,6 +729,13 @@ class CalibratronGUI:
         fw_asreceived = info_asreceived.firmware
         current_name = info_asreceived.device_name
 
+        # 2b. Ask for the name now, before the long unattended steps, so the
+        # only interactive pause in a run is at its very start. The rename
+        # itself waits until after the flash (step 4) - flashing can clear it.
+        new_name = self._ask_device_name(current_name)
+        if new_name is None:
+            print(f"[name] keeping the current name {current_name!r}")
+
         # 3. Firmware.
         provenance = None
         if self.opt_flash.get():
@@ -586,8 +761,7 @@ class CalibratronGUI:
 
         info_before = helpers.ambit_reboot(port_ambit)
 
-        # 4. Name.
-        new_name = self.name_var.get().strip() or None
+        # 4. Name (asked for at step 2b, applied here: after any flash).
         if new_name and new_name != current_name:
             helpers.set_ambit_name(port_ambit, new_name)
             print(f"[name] {current_name!r} -> {new_name!r}")
@@ -666,13 +840,9 @@ class CalibratronGUI:
                                     directory=rc.CALIBRATIONS_DIR)
 
         if self.opt_publish.get():
-            topic = (f"experiment/data_ingest/v1/{rc.OJII_EXPERIMENT_ID}/"
-                     f"{rc.OJII_SENSOR_FAMILY}/{rc.OJII_SENSOR_VERSION}/"
-                     f"{rc.OJII_SENSOR_ID}/{rc.OJII_PROTOCOL_ID}")
             try:
-                helpers.publish_payload_mqtt5(payload, topic=topic,
-                                              certs_dir=rc.OJII_CERTS_DIR,
-                                              endpoint=rc.OJII_ENDPOINT)
+                # The window signed in; the run just borrows that session.
+                rc.publish_to_openjii(payload, client=self.oj_client)
                 print("[publish] uploaded to openJII")
             except Exception as exc:
                 print(f"[publish] openJII upload failed ({exc}); the calibration "
@@ -696,8 +866,8 @@ class CalibratronGUI:
                 (tier3_cal or {}).get("status"),
                 "LED written" if (led_cal or {}).get("uploaded") else None))) or "ran",
         }))
-        print(f"\n[gui] device done - swap the next Ambit into the fixture, "
-              f"enter its name and press Start again")
+        print(f"\n[gui] device done - swap the next Ambit into the fixture "
+              f"and press Start again")
 
     # ---- results rendering ---------------------------------------------------
 

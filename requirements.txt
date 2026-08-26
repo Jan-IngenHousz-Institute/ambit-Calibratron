@@ -10,7 +10,10 @@ numpy                 # data handling / curve fitting
 matplotlib            # calibration plots
 pyserial              # serial comms with the Ambit / MiniPAR / DC source
 
-paho-mqtt>=2.0        # MQTT v5 publishing (mqtt_publish.py, helpers.publish_payload_mqtt5)
+paho-mqtt>=2.0        # MQTT v5 publishing, incl. the SigV4 WebSocket transport the
+                      # openJII upload uses (helpers.publish_payload_mqtt5_wss)
+certifi               # optional: portable CA roots for the openJII API calls
+                      # (openjii_auth falls back to the platform trust store)
 esptool               # ESP32 firmware flashing (uploader.py); on Windows the bundled
                       # firmware_ambit/esptool.exe is used instead, so this is optional there
 

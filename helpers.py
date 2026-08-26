@@ -1598,7 +1598,6 @@ def publish_payload_mqtt5(payload, topic, certs_dir, endpoint, *,
         pass
 
     import ssl
-    import threading
     try:
         import paho.mqtt.client as mqtt
         from paho.mqtt.enums import CallbackAPIVersion
@@ -1608,7 +1607,48 @@ def publish_payload_mqtt5(payload, topic, certs_dir, endpoint, *,
     ca_file, cert_file, key_file = _resolve_cert_files(certs_dir)
     if client_id is None:
         client_id = os.path.basename(os.path.normpath(certs_dir)) or "calibratron"
+    endpoint, port = _split_endpoint(endpoint, port)
 
+    client = mqtt.Client(callback_api_version=CallbackAPIVersion.VERSION2,
+                         client_id=client_id, protocol=mqtt.MQTTv5)
+    client.tls_set(ca_certs=ca_file, certfile=cert_file, keyfile=key_file,
+                   tls_version=ssl.PROTOCOL_TLS_CLIENT)
+    return _mqtt5_deliver(client, payload, topic, endpoint, port, client_id,
+                          qos=qos, timeout=timeout)
+
+
+def publish_payload_mqtt5_wss(payload, topic, endpoint, credentials, *,
+                              client_id="calibratron", port=443, qos=1,
+                              timeout=10.0):
+    """Publish over MQTT 5 on a SigV4-signed WebSocket (AWS IoT Core).
+
+    The bench's route to openJII: ``credentials`` are the short-lived AWS
+    credentials :meth:`openjii_auth.OpenJIIClient.iot_credentials` hands the
+    signed-in operator, so no X.509 material is ever kept on the bench PC.
+    ``client_id`` still travels to the ingest rule as ``clientid()``.
+    """
+    try:
+        import paho.mqtt.client as mqtt
+        from paho.mqtt.enums import CallbackAPIVersion
+    except ImportError as exc:
+        raise ImportError("publish_payload_mqtt5_wss needs paho-mqtt >= 2.0") from exc
+
+    from openjii_auth import presign_iot_wss_path
+
+    endpoint, port = _split_endpoint(endpoint, port)
+    client = mqtt.Client(callback_api_version=CallbackAPIVersion.VERSION2,
+                         client_id=client_id, protocol=mqtt.MQTTv5,
+                         transport="websockets")
+    # Signed per connection: the path carries the whole SigV4 authorisation,
+    # and a stale one is a 403 on the upgrade rather than a retryable error.
+    client.ws_set_options(path=presign_iot_wss_path(endpoint, credentials))
+    client.tls_set()
+    return _mqtt5_deliver(client, payload, topic, endpoint, port, client_id,
+                          qos=qos, timeout=timeout)
+
+
+def _split_endpoint(endpoint, port):
+    """``mqtts://host:8883/x`` -> ``("host", 8883)``; bare hosts keep ``port``."""
     endpoint = endpoint.strip()
     if "://" in endpoint:
         endpoint = endpoint.split("://", 1)[1]
@@ -1617,6 +1657,13 @@ def publish_payload_mqtt5(payload, topic, certs_dir, endpoint, *,
         host, _, maybe_port = endpoint.rpartition(":")
         if maybe_port.isdigit():
             endpoint, port = host, int(maybe_port)
+    return endpoint, port
+
+
+def _mqtt5_deliver(client, payload, topic, endpoint, port, client_id, *,
+                   qos=1, timeout=10.0):
+    """Connect an already-configured client, publish once, disconnect."""
+    import threading
 
     body = payload if isinstance(payload, (bytes, bytearray, str)) else json.dumps(payload)
     connected, conn_state = threading.Event(), {}
@@ -1625,11 +1672,7 @@ def publish_payload_mqtt5(payload, topic, certs_dir, endpoint, *,
         conn_state["rc"] = reason_code
         connected.set()
 
-    client = mqtt.Client(callback_api_version=CallbackAPIVersion.VERSION2,
-                         client_id=client_id, protocol=mqtt.MQTTv5)
     client.on_connect = _on_connect
-    client.tls_set(ca_certs=ca_file, certfile=cert_file, keyfile=key_file,
-                   tls_version=ssl.PROTOCOL_TLS_CLIENT)
 
     logger.info("MQTT5 connecting to %s:%d as %s ...", endpoint, port, client_id)
     client.connect(endpoint, port, keepalive=60)

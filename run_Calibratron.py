@@ -48,6 +48,7 @@ if _ROOT not in sys.path:
     sys.path.append(_ROOT)
 
 import helpers
+import openjii_auth             # operator sign-in + the credentials to publish
 import quality                  # LED origin fit + ADPD gate, firmware bounds mirrored
 import spec_cal                 # cmd-35 codecs, tier math, the tier-3 affine gate
 
@@ -140,16 +141,43 @@ MATH_CHECK_RTOL = 2e-3
 # openJII ingest. Topic layout is
 # experiment/data_ingest/v1/<experiment>/<family>/<version>/<sensor>/<protocol>
 # The AWS IoT rule prepends topic() and clientid(), so neither is sent here.
+#
+# The bench authenticates as the *operator*, not as a device: an openJII API
+# key buys short-lived AWS credentials and the publish rides a SigV4-signed
+# WebSocket (see :mod:`openjii_auth` for why, and for how to sign in). No
+# X.509 bundle is kept on the bench PC any more, so there is no certs dir and
+# nothing that a re-issue on another bench can revoke underneath this one.
 PUBLISH_TO_OPENJII  = True
+OJII_ENV            = "prod"                    # openjii_auth.ENVIRONMENTS
 OJII_EXPERIMENT_ID  = "993ae58e-2e87-45ef-96e1-5bbdb0916817"
 OJII_SENSOR_FAMILY  = "ambit"
 OJII_SENSOR_VERSION = "v1.0"
-OJII_SENSOR_ID      = "ambit_calibration_1"     # must match the X.509 Thing name
+#: Also the MQTT client id, so clientid() keeps reading the same downstream.
+OJII_SENSOR_ID      = "ambit_calibration_1"
 OJII_PROTOCOL_ID    = "CALIBRATION"
-OJII_CERTS_DIR      = os.path.join(os.path.dirname(HERE),
-                                   "ambit_calibration_1_certs",
-                                   "ambit_calibration_1_certs")
-OJII_ENDPOINT       = "a3qrmjf5m5y241-ats.iot.eu-central-1.amazonaws.com"
+OJII_ENDPOINT       = openjii_auth.environment(OJII_ENV).mqtt_host
+
+
+def openjii_topic():
+    return (f"experiment/data_ingest/v1/{OJII_EXPERIMENT_ID}/{OJII_SENSOR_FAMILY}/"
+            f"{OJII_SENSOR_VERSION}/{OJII_SENSOR_ID}/{OJII_PROTOCOL_ID}")
+
+
+def publish_to_openjii(payload, *, client=None, topic=None):
+    """Publish one calibration record as the signed-in openJII operator.
+
+    ``client`` is a validated :class:`openjii_auth.OpenJIIClient` when the
+    caller already holds one (the GUI signs in at the window, not per run);
+    without one the stored API key is used, which is the CLI's only option.
+    Raises - the caller decides whether a failed upload is fatal, and on this
+    bench it never is: the record is on disk before this runs.
+    """
+    client = client or openjii_auth.signed_in_client(OJII_ENV)
+    credentials = client.iot_credentials()
+    return helpers.publish_payload_mqtt5_wss(
+        payload, topic=topic or openjii_topic(),
+        endpoint=client.env.mqtt_host, credentials=credentials,
+        client_id=OJII_SENSOR_ID)
 
 
 # ============================================================================
@@ -913,11 +941,8 @@ def main():
         print("[publish] PUBLISH_TO_OPENJII is False - not uploading")
         return payload
 
-    topic = (f"experiment/data_ingest/v1/{OJII_EXPERIMENT_ID}/{OJII_SENSOR_FAMILY}/"
-             f"{OJII_SENSOR_VERSION}/{OJII_SENSOR_ID}/{OJII_PROTOCOL_ID}")
     try:
-        helpers.publish_payload_mqtt5(payload, topic=topic,
-                                      certs_dir=OJII_CERTS_DIR, endpoint=OJII_ENDPOINT)
+        publish_to_openjii(payload)
         print("[publish] uploaded to openJII")
     except Exception as exc:
         # The calibration is already on disk, so a network problem must not look
