@@ -680,9 +680,19 @@ class CalibratronGUI:
                   f"{version!r} - skipping flash")
             return 0, provenance
         print(f"[flash] {decision}: {current_version!r} -> {version!r} (local folder)")
-        helpers.flash_ambit_firmware(folder)
+        if not helpers.flash_ambit_firmware(folder):
+            raise RuntimeError("Local firmware flash did not complete")
         time.sleep(1.0)
         helpers._invalidate_port_cache()
+        running = rc._detect_ambit_version()
+        try:
+            verified = firmware_fetch.compare_device_versions(running, version) == 0
+        except (TypeError, ValueError):
+            verified = False
+        if not verified:
+            raise RuntimeError(f"Local firmware readback mismatch: running {running!r}, "
+                               f"expected device-visible {firmware_fetch.device_visible_version(version)!r}")
+        print(f"[flash] verified device-equivalent firmware {running}")
         return 0, provenance
 
     def _run_device_worker(self):

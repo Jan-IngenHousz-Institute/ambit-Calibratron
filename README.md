@@ -219,8 +219,8 @@ configuration directory managed by `openjii_auth.py`.
 `.github/workflows/gui-release.yml` tests and builds Windows x64, Linux x64,
 and macOS ARM64 bundles on pull requests, pushes to `main`, and manual runs.
 Every platform runs the packaged executable's `--smoke-test`, which constructs
-the GUI and exercises bundled esptool without connecting to hardware or signing
-in. PR and manual runs provide downloadable Actions artifacts.
+the GUI, loads bundled CA certificates without the build host's trust store,
+and exercises bundled esptool without connecting to hardware or signing in. PR and manual runs provide downloadable Actions artifacts.
 
 After all three builds pass on `main`, the same run's ZIPs and `SHA256SUMS` are
 uploaded to a draft release and then published. Tags start at

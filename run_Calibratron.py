@@ -220,7 +220,7 @@ def flash_firmware(force_flash=False, current_version=None,
 
 
 def save_payload(payload, mac=None, directory=CALIBRATIONS_DIR):
-    """Write the calibration payload to '<YYYY-MM-DD_HH-MM-SS>_<MAC>.json'.
+    """Write the calibration payload to '<YYYY-MM-DD_HH-MM-SS_microseconds>_<safe-MAC>.json'.
 
     :param payload: the JSON string (or dict) from helpers.make_calibration_payload
     :param mac: device MAC for the filename; if None, read from payload["device_id"]

@@ -16,3 +16,13 @@ def data_dir():
     else:
         base = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share"))
     return base / "Calibratron"
+
+
+def configure_tls():
+    """Let stdlib urllib and MQTT use packaged roots on clean installations.
+
+    Retain an explicit operator CA override (for example an enterprise proxy).
+    """
+    if getattr(sys, "frozen", False):
+        import certifi
+        os.environ.setdefault("SSL_CERT_FILE", certifi.where())

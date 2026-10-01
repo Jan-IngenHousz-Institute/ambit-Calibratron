@@ -149,4 +149,14 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           TAG: ${{ steps.version.outputs.tag }}
-        run: gh release edit "$TAG" --repo "$REPO" --draft=false --latest
+        run: |
+          set -euo pipefail
+          MAIN_SHA=$(gh api "repos/${REPO}/git/ref/heads/main" --jq '.object.sha')
+          # An old run can be retried after a newer release. Publish its exact
+          # historical binaries, but never demote the current main release.
+          if [[ "$MAIN_SHA" == "$GITHUB_SHA" ]]; then
+            gh release edit "$TAG" --repo "$REPO" --draft=false --latest
+          else
+            gh release edit "$TAG" --repo "$REPO" --draft=false --latest=false
+            echo "Historical release ${TAG}; newer main remains Latest." >> "$GITHUB_STEP_SUMMARY"
+          fi
