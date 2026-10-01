@@ -1,0 +1,150 @@
+name: Build and release Calibratron GUI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Keep releases serial; a manual run builds artifacts but never publishes.
+concurrency:
+  group: calibratron-gui-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            platform: linux-x64
+            executable: dist/calibratron/calibratron
+          - os: windows-latest
+            platform: windows-x64
+            executable: dist/calibratron/calibratron.exe
+          - os: macos-14
+            platform: macos-arm64
+            executable: dist/calibratron.app/Contents/MacOS/calibratron
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements-*.txt
+      - name: Install dependencies
+        run: python -m pip install -r requirements-build.txt
+      - name: Run tests
+        run: python -m pytest tests -q
+      - name: Build standalone application
+        shell: bash
+        run: |
+          pyinstaller --noconfirm --clean --onedir --windowed \
+            --name calibratron --paths . --collect-all esptool \
+            packaging/launcher.py
+      - name: Smoke-test executable (Linux)
+        if: runner.os == 'Linux'
+        run: xvfb-run -a '${{ matrix.executable }}' --smoke-test
+      - name: Smoke-test executable (Windows and macOS)
+        if: runner.os != 'Linux'
+        shell: bash
+        run: |
+          python - <<'PY'
+          import subprocess
+          subprocess.run(['${{ matrix.executable }}', '--smoke-test'], check=True, timeout=60)
+          PY
+      - name: Verify smoke test completed
+        shell: bash
+        run: test -s packaged-smoke-ok.txt
+      - name: Package Linux
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p out
+          cd dist
+          zip -r -y ../out/calibratron-${{ matrix.platform }}.zip calibratron
+      - name: Package macOS
+        if: runner.os == 'macOS'
+        run: |
+          mkdir -p out
+          ditto -c -k --keepParent dist/calibratron.app out/calibratron-${{ matrix.platform }}.zip
+      - name: Package Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force out | Out-Null
+          Compress-Archive -Path dist/calibratron -DestinationPath out/calibratron-${{ matrix.platform }}.zip
+      - uses: actions/upload-artifact@v6
+        with:
+          name: calibratron-${{ matrix.platform }}-${{ github.sha }}
+          path: out/*.zip
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    name: Publish GUI release
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v6
+        with:
+          pattern: calibratron-*-${{ github.sha }}
+          merge-multiple: true
+          path: out
+      - name: Verify bundles and create checksums
+        run: |
+          set -euo pipefail
+          cd out
+          test -s calibratron-linux-x64.zip
+          test -s calibratron-windows-x64.zip
+          test -s calibratron-macos-arm64.zip
+          sha256sum calibratron-*.zip > SHA256SUMS
+      - name: Select release version
+        id: version
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const releases = await github.paginate(github.rest.repos.listReleases, context.repo);
+            const sameCommit = releases.find(r => r.tag_name.startsWith('calibratron-v') && r.target_commitish === context.sha);
+            if (sameCommit) {
+              core.setOutput('tag', sameCommit.tag_name);
+              core.setOutput('published', !sameCommit.draft);
+              return;
+            }
+            const tags = await github.paginate(github.rest.repos.listTags, context.repo);
+            const versions = [...tags.map(t => t.name), ...releases.map(r => r.tag_name)]
+              .map(t => /^calibratron-v(\d+)\.(\d+)\.(\d+)$/.exec(t))
+              .filter(Boolean).map(m => m.slice(1).map(Number))
+              .sort((a, b) => a[0]-b[0] || a[1]-b[1] || a[2]-b[2]);
+            const last = versions.at(-1);
+            const next = last ? `${last[0]}.${last[1]}.${last[2]+1}` : '0.1.0';
+            core.setOutput('tag', `calibratron-v${next}`);
+            core.setOutput('published', false);
+      - name: Upload complete draft release
+        if: steps.version.outputs.published != 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: Calibratron ${{ steps.version.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          draft: true
+          generate_release_notes: true
+          files: out/*
+          fail_on_unmatched_files: true
+      - name: Publish release
+        if: steps.version.outputs.published != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: gh release edit "$TAG" --repo "$REPO" --draft=false --latest

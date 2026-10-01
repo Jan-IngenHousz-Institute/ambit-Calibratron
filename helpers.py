@@ -890,7 +890,8 @@ REPO_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # Default cache root used when no firmware folder is passed in; must match the
 # one run_Calibratron.py uses so both share one download.
-AMBIT_FIRMWARE_CACHE = os.path.join(REPO_DIR, "firmware_cache")
+from runtime_paths import data_dir
+AMBIT_FIRMWARE_CACHE = str(data_dir() / "firmware_cache")
 
 
 def find_file(start_dir, filename):
@@ -967,6 +968,8 @@ def esptool_command():
 
     :raises RuntimeError: if no esptool is available
     """
+    if getattr(sys, "frozen", False):
+        return [sys.executable, "--esptool"]
     if os.name == "nt":
         local_exe = find_file(REPO_DIR, "esptool.exe")
         if local_exe:
