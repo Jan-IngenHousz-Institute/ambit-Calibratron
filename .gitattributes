@@ -1,0 +1,2 @@
+# Captured firmware fixtures have byte-for-byte release size/digest assertions.
+/tests/fixtures/*.json -text

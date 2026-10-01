@@ -31,6 +31,7 @@ jobs:
             platform: macos-arm64
             executable: dist/calibratron.app/Contents/MacOS/calibratron
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v6
         with:
@@ -52,7 +53,7 @@ jobs:
             packaging/launcher.py
       - name: Smoke-test executable (Linux)
         if: runner.os == 'Linux'
-        run: xvfb-run -a '${{ matrix.executable }}' --smoke-test
+        run: timeout 90s xvfb-run -a '${{ matrix.executable }}' --smoke-test
       - name: Smoke-test executable (Windows and macOS)
         if: runner.os != 'Linux'
         shell: bash
@@ -93,6 +94,7 @@ jobs:
     needs: build
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: write
     steps:

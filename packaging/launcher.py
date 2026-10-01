@@ -26,7 +26,7 @@ if __name__ == "__main__":
         calibratron_gui.CalibratronGUI(root, auto_sign_in=False)
         root.update()
         root.destroy()
-        subprocess.run([*helpers.esptool_command(), "version"], check=True)
+        subprocess.run([*helpers.esptool_command(), "version"], check=True, timeout=30)
         assert runtime_paths.data_dir() != Path(helpers.__file__).resolve().parent
         Path("packaged-smoke-ok.txt").write_text("GUI imports, Tk and esptool passed\n")
     else:

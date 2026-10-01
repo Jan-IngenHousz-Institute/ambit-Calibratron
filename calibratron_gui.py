@@ -170,10 +170,11 @@ class CalibratronGUI:
         self.settings = openjii_auth.Settings.load()
         #: Validated OpenJIIClient, or None while nobody is signed in.
         self.oj_client = None
+        self._auth_generation = 0
 
+        self._build_statusbar()
         self._build_left()
         self._build_right()
-        self._build_statusbar()
 
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         root.after(100, self._drain_queue)
@@ -227,7 +228,7 @@ class CalibratronGUI:
                   justify="left").grid(row=3, column=1, columnspan=2, sticky="w")
 
         self.fw_tree = ttk.Treeview(fw, columns=("ok", "detail"), show="tree headings",
-                                    height=6)
+                                    height=4)
         self.fw_tree.heading("#0", text="file")
         self.fw_tree.heading("ok", text="ok")
         self.fw_tree.heading("detail", text="detail")
@@ -420,6 +421,7 @@ class CalibratronGUI:
         return openjii_auth.environment(self.oj_env.get())
 
     def _on_env_changed(self):
+        self._auth_generation += 1
         self.settings.environment = self.oj_env.get()
         self.settings.save()
         self.oj_client = None
@@ -463,6 +465,10 @@ class CalibratronGUI:
         """Validate off the main thread: this is a network round trip, and it
         happens while the operator is mounting the next device."""
         env = self._env()
+        self._auth_generation += 1
+        generation = self._auth_generation
+        self.oj_client = None
+        self.oj_user.set("validating…")
 
         def work():
             client = openjii_auth.OpenJIIClient(env, key)
@@ -474,12 +480,14 @@ class CalibratronGUI:
                 else:
                     _LOG_QUEUE.put(("error", f"openJII sign-in: {exc}"))
                 return
-            _LOG_QUEUE.put(("signed_in", (client, key)))
+            _LOG_QUEUE.put(("signed_in", (generation, client, key)))
 
         threading.Thread(target=work, daemon=True).start()
 
     def _show_signed_in(self, payload):
-        client, key = payload
+        generation, client, key = payload
+        if generation != self._auth_generation or client.env.key != self.oj_env.get():
+            return
         self.oj_client = client
         self.settings.set_api_key(client.env.key, key)
         self.settings.environment = client.env.key
@@ -719,8 +727,11 @@ class CalibratronGUI:
         if options["led"]:
             led_cal = rc.calibrate_led(port, ports["emit_led"],
                                       upload=options["upload"], show_plot=False)
-            _LOG_QUEUE.put(("led", (led_cal, options["upload"])))
         after = helpers.ambit_reboot(port)
+        if led_cal is not None:
+            display = dict(led_cal, act_led_coeff_before=before.act_led_coeff,
+                           act_led_coeff_after=after.act_led_coeff)
+            _LOG_QUEUE.put(("led", (display, options["upload"])))
         payload = helpers.make_calibration_payload(
             before, after, par_cal=par_cal, led_cal=led_cal,
             firmware_release_provenance=provenance)
@@ -767,6 +778,8 @@ class CalibratronGUI:
         self.led_vars["status"].set(fit_status(record, upload))
         self.led_vars["coefficient"].set(_fmt(record.get("slope")))
         self.led_vars["r2"].set(_fmt(record.get("r2")))
+        self.led_vars["before"].set(_fmt(record.get("act_led_coeff_before")))
+        self.led_vars["after"].set(_fmt(record.get("act_led_coeff_after")))
         self.led_tree.delete(*self.led_tree.get_children())
         for ref, setting in zip(record["x"], record["y"]):
             self.led_tree.insert("", "end", text=_fmt(setting), values=(_fmt(ref),))

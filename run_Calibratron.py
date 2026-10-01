@@ -230,7 +230,8 @@ def save_payload(payload, mac=None, directory=CALIBRATIONS_DIR):
     data = json.loads(payload) if isinstance(payload, str) else payload
     text = payload if isinstance(payload, str) else json.dumps(payload, indent=2)
     mac  = mac or data.get("device_id") or "UNKNOWN"
-    fname = f"{datetime.now():%Y-%m-%d_%H-%M-%S}_{mac}.json"
+    safe_mac = re.sub(r"[^A-Za-z0-9_.-]", "_", str(mac))
+    fname = f"{datetime.now():%Y-%m-%d_%H-%M-%S_%f}_{safe_mac}.json"
     os.makedirs(directory, exist_ok=True)
     path = os.path.join(directory, fname)
     with open(path, "w", encoding="utf-8") as f:
