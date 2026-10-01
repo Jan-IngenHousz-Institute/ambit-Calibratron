@@ -26,6 +26,8 @@ def _ensure_requirements(req_file="requirements.txt"):
 
     :param req_file: requirements file name, resolved next to this script.
     """
+    if getattr(sys, "frozen", False):
+        return
     import importlib.metadata as md
 
     here = os.path.dirname(os.path.abspath(__file__))
@@ -56,7 +58,8 @@ def _ensure_requirements(req_file="requirements.txt"):
     print("[deps] dependencies installed")
 
 
-_ensure_requirements()   # install missing deps before the third-party imports below
+if __name__ == "__main__":
+    _ensure_requirements()  # source CLI only; importing the GUI must not install packages
 
 import numpy as np
 import helpers; importlib.reload(helpers)
@@ -68,7 +71,9 @@ import calibration_quality; importlib.reload(calibration_quality)
 # Using helpers.__file__ is robust in notebooks where this module's own
 # __file__ may be a relative path and the kernel CWD is the workspace root,
 # which would otherwise make os.path.abspath(__file__) point to the wrong dir.
-HERE             = os.path.dirname(os.path.abspath(helpers.__file__))
+from runtime_paths import data_dir
+
+HERE             = str(data_dir())
 # Downloaded Ambit firmware releases land here as firmware_cache/<version>/
 # (manifest.json + images); git-ignored, populated by firmware_fetch.
 FIRMWARE_CACHE_DIR = os.path.join(HERE, "firmware_cache")
@@ -215,7 +220,7 @@ def flash_firmware(force_flash=False, current_version=None,
 
 
 def save_payload(payload, mac=None, directory=CALIBRATIONS_DIR):
-    """Write the calibration payload to '<YYYY-MM-DD_HH-MM-SS>_<MAC>.json'.
+    """Write the calibration payload to '<YYYY-MM-DD_HH-MM-SS_microseconds>_<safe-MAC>.json'.
 
     :param payload: the JSON string (or dict) from helpers.make_calibration_payload
     :param mac: device MAC for the filename; if None, read from payload["device_id"]
@@ -225,7 +230,8 @@ def save_payload(payload, mac=None, directory=CALIBRATIONS_DIR):
     data = json.loads(payload) if isinstance(payload, str) else payload
     text = payload if isinstance(payload, str) else json.dumps(payload, indent=2)
     mac  = mac or data.get("device_id") or "UNKNOWN"
-    fname = f"{datetime.now():%Y-%m-%d_%H-%M-%S}_{mac}.json"
+    safe_mac = re.sub(r"[^A-Za-z0-9_.-]", "_", str(mac))
+    fname = f"{datetime.now():%Y-%m-%d_%H-%M-%S_%f}_{safe_mac}.json"
     os.makedirs(directory, exist_ok=True)
     path = os.path.join(directory, fname)
     with open(path, "w", encoding="utf-8") as f:
@@ -314,7 +320,7 @@ def calibrate_adpd_baseline(port_ambit, previous, *, upload=UPLOAD_GAINS, input_
     return result
 
 
-def calibrate_par_sensor(port_ambit, port_ref, port_dc, currents=PAR_CAL_CURRENTS, upload=UPLOAD_GAINS):
+def calibrate_par_sensor(port_ambit, port_ref, port_dc, currents=PAR_CAL_CURRENTS, upload=UPLOAD_GAINS, *, show_plot=True):
     """Sweep the calibration lamp, fit Ambit-raw PAR vs MiniPAR reference, show
     the plot, and (optionally) upload the slope as the Ambit PAR gain.
 
@@ -362,8 +368,9 @@ def calibrate_par_sensor(port_ambit, port_ref, port_dc, currents=PAR_CAL_CURRENT
 
     old = helpers.ambit_reboot(port_ambit).light_slope
     print(f"[PAR cal] fit slope={slope:.4f}  R^2={r2:.6f}  (current light_slope={old:.4f})")
-    helpers.plot_data_and_fit(x, y, coeffs, r2,
-                              xlabel="Ambit PAR (raw)", ylabel="MiniPAR PAR (reference)")
+    if show_plot:
+        helpers.plot_data_and_fit(x, y, coeffs, r2,
+                                  xlabel="Ambit PAR (raw)", ylabel="MiniPAR PAR (reference)")
 
     if not quality["passed"]:
         print("[PAR cal] REJECTED; existing gain kept: " + "; ".join(quality["reasons"]))
@@ -376,7 +383,7 @@ def calibrate_par_sensor(port_ambit, port_ref, port_dc, currents=PAR_CAL_CURRENT
     return cal
 
 
-def calibrate_led(port_ambit, port_emit, settings=LED_CAL_SETTINGS, upload=UPLOAD_GAINS):
+def calibrate_led(port_ambit, port_emit, settings=LED_CAL_SETTINGS, upload=UPLOAD_GAINS, *, show_plot=True):
     """Sweep the Ambit actinic LED, fit measured PAR vs LED setting, show the
     plot, and (optionally) upload the slope as the Ambit LED gain.
 
@@ -419,8 +426,9 @@ def calibrate_led(port_ambit, port_emit, settings=LED_CAL_SETTINGS, upload=UPLOA
 
     if not quality["passed"]:
         print("[LED cal] REJECTED; existing gain kept: " + "; ".join(quality["reasons"]))
-        helpers.plot_data_and_fit(x, y, coeffs, r2,
-                                xlabel="MiniPAR PAR (over LED)", ylabel="Ambit LED setting")
+        if show_plot:
+            helpers.plot_data_and_fit(x, y, coeffs, r2,
+                                    xlabel="MiniPAR PAR (over LED)", ylabel="Ambit LED setting")
         return cal
 
     print(f"[LED cal] fit slope={slope:.4f}  R^2={r2:.6f}  (current act_led_coeff={old:.4f})")

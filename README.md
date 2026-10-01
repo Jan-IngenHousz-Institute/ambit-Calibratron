@@ -173,3 +173,73 @@ Anonymous GitHub REST inspection on 2026-08-06 showed public repository
   retry; the tool refuses to guess.
 - **Firmware version unknown:** normal flow fails closed. Inspect the serial boot
   log and connection; use `FORCE_FLASH_FIRMWARE` only for deliberate recovery.
+
+## Desktop GUI
+
+The desktop interface is extracted from PR #4. It uses this branch's existing
+PAR origin fit (`light_slope`) and actinic LED calibration, including quality
+gates and write/readback verification. The cmd-35 spectral/tier-3 calibration
+changes remain in PR #4. Dark-baseline calibration is still available through
+the CLI; the GUI handles PAR and LED sweeps.
+
+Download the ZIP for your platform from this repository's GitHub Releases:
+
+- `calibratron-windows-x64.zip`: extract the whole folder and run `calibratron.exe`.
+- `calibratron-linux-x64.zip`: extract and run `calibratron/calibratron` (Ubuntu 22.04 or newer).
+- `calibratron-macos-arm64.zip`: extract and open `calibratron.app` (Apple Silicon).
+
+Keep the bundle's supporting files beside the executable. Python, notebooks,
+and esptool do not need to be installed separately. Serial drivers and the bench
+hardware are still required. These initial bundles are unsigned; Windows and
+macOS may display an unknown-publisher warning. Intel macOS is not yet packaged.
+
+For a source checkout, install `requirements-gui.txt`, then run
+`python calibratron_gui.py`. Linux also needs the distribution's `python3-tk`.
+Use **Rescan bench**, select the steps, and press **Start calibration**.
+Firmware force-reflash and OpenJII publishing default to off. OpenJII API-key
+sign-in is optional; calibration records are saved locally before upload.
+A local firmware folder must include the verified immutable release metadata,
+manifest, and matching images, just like the CLI's cache.
+
+Packaged applications save `calibrations/` and `firmware_cache/` beneath:
+
+| Platform | Data directory |
+| --- | --- |
+| Windows | `%LOCALAPPDATA%/Calibratron` |
+| macOS | `~/Library/Application Support/Calibratron` |
+| Linux | `${XDG_DATA_HOME:-~/.local/share}/Calibratron` |
+
+Set `CALIBRATRON_DATA_DIR` to override packaged storage. Source checkouts retain
+the existing repository-local storage. Closing the GUI preserves the verified
+firmware cache for offline use. API-key settings use the separate per-user
+configuration directory managed by `openjii_auth.py`.
+
+## GUI release pipeline
+
+`.github/workflows/gui-release.yml` tests and builds Windows x64, Linux x64,
+and macOS ARM64 bundles on pull requests, pushes to `main`, and manual runs.
+Every platform runs the packaged executable's `--smoke-test`, which constructs
+the GUI, loads bundled CA certificates without the build host's trust store,
+and exercises bundled esptool without connecting to hardware or signing in. PR and manual runs provide downloadable Actions artifacts.
+
+After all three builds pass on `main`, the same run's ZIPs and `SHA256SUMS` are
+uploaded to a draft release and then published. Tags start at
+`calibratron-v0.1.0` and automatically increment the patch number. Rerunning an
+already published commit does not create another release. Publication uses only
+the built-in `GITHUB_TOKEN`; no extra release secret or hand-created tag is
+needed. Unlike Ambyte's promotion workflow, this workflow builds the merged
+`main` commit, so merge commits, squash merges, and direct pushes work alike.
+
+Local verification:
+
+```bash
+python -m pip install -r requirements-build.txt
+python -m pytest tests -q
+pyinstaller --noconfirm --clean --onedir --windowed --name calibratron \
+  --paths . --collect-all esptool packaging/launcher.py
+# Linux requires a display, or: xvfb-run -a ...
+dist/calibratron/calibratron --smoke-test
+```
+
+The original stdlib-only firmware tests can still run without GUI dependencies.
+Automated packaging checks do not replace a physical calibration bench test.
