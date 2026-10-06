@@ -420,15 +420,26 @@ class TestDeviceVersionPolicy(unittest.TestCase):
         ))
 
 
-class TestMergedMainRegression(unittest.TestCase):
-    """Guard the OpenJII spectrometer/leaf functions brought in from main."""
+class TestBenchContractRegression(unittest.TestCase):
+    """Guard the bench I/O contract the tier-3 calibration depends on.
 
-    def test_spectrometer_and_leaf_collection_symbols_remain_present(self):
+    These are the symbols a release must not silently lose: the MiniPAR raw
+    spectrum, the reset-free serial open, cached role discovery, the ADPD trace
+    with its pulse-LED zeroing, the integrity-gated flash, and the release
+    policy calls in the runner.
+    """
+
+    def test_bench_io_and_flash_policy_symbols_remain_present(self):
         root = Path(__file__).resolve().parent.parent
         helpers_tree = ast.parse((root / "helpers.py").read_text(encoding="utf-8"))
-        runner_tree = ast.parse((root / "run_Calibratron.py").read_text(encoding="utf-8"))
-        helper_functions = {
-            node.name for node in ast.walk(helpers_tree) if isinstance(node, ast.FunctionDef)
+        runner_tree = ast.parse((root / "run_calibratron.py").read_text(encoding="utf-8"))
+        helper_defs = {
+            node.name: node for node in ast.walk(helpers_tree)
+            if isinstance(node, ast.FunctionDef)
+        }
+        helper_globals = {
+            target.id for node in helpers_tree.body if isinstance(node, ast.Assign)
+            for target in node.targets if isinstance(target, ast.Name)
         }
         runner_constants = {
             node.value for node in ast.walk(runner_tree)
@@ -437,24 +448,22 @@ class TestMergedMainRegression(unittest.TestCase):
         runner_attributes = {
             node.attr for node in ast.walk(runner_tree) if isinstance(node, ast.Attribute)
         }
-        helper_defs = {
-            node.name: node for node in ast.walk(helpers_tree)
-            if isinstance(node, ast.FunctionDef)
-        }
-        self.assertTrue({"get_spec_raw_MP", "record_arrun_AMB"} <= helper_functions)
-        self.assertTrue(any("ambit_spec" in value for value in runner_constants))
-        self.assertIn("flash_decision", runner_attributes)
+        self.assertTrue({"get_spec_raw_MP", "open_serial_no_reset", "discover_roles",
+                         "arrun", "zero_pulse_currents", "flash_ambit_firmware",
+                         "esptool_command"} <= set(helper_defs))
+        self.assertIn("HELLO_FW_RE", helper_globals)
+        self.assertIn("ambit_spec_channels", runner_constants)
+        self.assertTrue({"flash_decision", "release_provenance"} <= runner_attributes)
+        # Flashing is gated on every image matching the manifest's size/sha256.
         self.assertTrue(any(
-            isinstance(node, ast.Attribute) and node.attr == "is_complete"
-            for node in ast.walk(helper_defs["flash_ambit"])
+            isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+            and node.func.id == "read_flash_layout"
+            for node in ast.walk(helper_defs["flash_ambit_firmware"])
         ))
-        self.assertTrue(any(
-            isinstance(node, ast.keyword) and node.arg == "timeout"
-            for node in ast.walk(helper_defs["_ambit_query"])
-        ))
-        self.assertTrue(any("FW:\\s*" in value for value in runner_constants))
-        self.assertTrue(any("leaf" in value for value in ast.get_docstring(helpers_tree).splitlines())
-                        or "leaf" in (root / "helpers.py").read_text(encoding="utf-8"))
+        # Bench questions are bounded: _query carries a read timeout and retries.
+        self.assertTrue({"timeout", "attempts"} <= {
+            arg.arg for arg in helper_defs["_query"].args.args})
+        self.assertIn("leaf", (root / "helpers.py").read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

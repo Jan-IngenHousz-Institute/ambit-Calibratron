@@ -16,7 +16,12 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Run firmware and merged-main regression tests
-        run: python -m unittest discover -s tests -v
-      - name: Compile changed Python entry points
-        run: python -m py_compile firmware_fetch.py calibration_quality.py run_Calibratron.py helpers.py
+      - name: Install dependencies
+        run: python -m pip install -r requirements-build.txt
+      - name: Run the bench, firmware and GUI regression tests
+        run: python -m pytest tests -q
+      - name: Compile the Python entry points
+        run: >-
+          python -m py_compile firmware_fetch.py helpers.py spec_cal.py quality.py
+          run_calibratron.py calibratron_gui.py openjii_auth.py runtime_paths.py
+          packaging/launcher.py

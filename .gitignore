@@ -230,3 +230,6 @@ __marimo__/
 
 # Local packaging verification
 packaged-smoke-ok.txt
+
+# Per-bench serial port hints written by helpers.discover_roles()
+.port_roles.json

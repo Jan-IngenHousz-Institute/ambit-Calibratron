@@ -1,8 +1,47 @@
-"""Calibratron desktop UI, extracted from PR #4 and using the main calibration backend."""
+"""Calibratron GUI - a tkinter front-end over run_calibratron.
+
+One window for a whole bench session: discover the instruments, run the same
+per-device pass as ``run_calibratron.main()`` (flash, name, tier-3 PAR, actinic
+LED, record, publish), and keep a table of every device calibrated since the
+window opened. Designed for back-to-back devices: swap the Ambit in the
+fixture, press Start again and answer the name prompt.
+
+What it deliberately does NOT change: all calibration logic, gates and record
+formats live in run_calibratron / helpers / spec_cal / quality and are called
+unmodified. This file is widgets and a worker thread, nothing else.
+
+Firmware can come from two places:
+  - the GitHub release (default) - exactly run_calibratron.flash_firmware();
+  - a local folder. "Check files" reports, file by file, whether the folder
+    is complete: manifest.json, the four flash images with the manifest's
+    sizes and sha256 digests, and release provenance. Image integrity is the
+    hard gate - a folder that fails size/sha256 never reaches esptool. Release
+    provenance is not: a files-complete local build flashes fine, and the
+    calibration record then carries an honest ``verified: false`` provenance
+    with the per-file hashes instead of the GitHub release proof.
+
+Publishing signs in as the operator, not as a device: one openJII API key,
+pasted once and kept in %APPDATA%/Calibratron (the ambyte flash GUI's key is
+picked up when it is already there, so most benches never see the dialog).
+Sign-in state is settled before Start, never after a twenty-minute run - see
+:mod:`openjii_auth` for why an API key is the only option and why the publish
+rides temporary AWS credentials rather than an X.509 bundle.
+
+The ADPD dark baseline step is not offered: it needs a fixture change mid-run
+(see the run_calibratron module docstring) and calibrates nothing on the PAR
+chain. Run it from the CLI when it is needed.
+
+On close the downloaded firmware cache (run_calibratron.FIRMWARE_CACHE_DIR)
+is deleted - releases are re-proven and re-downloaded next session, so the
+bench never trusts a stale cache. A user-selected local firmware folder is
+never touched.
+"""
+
 from __future__ import annotations
 
 import os
 import queue
+import shutil
 import sys
 import threading
 import time
@@ -53,13 +92,11 @@ class _Tee:
 
 
 sys.stdout = _Tee(sys.stdout)
-sys.stderr = _Tee(sys.stderr)
 
 import firmware_fetch
 import helpers
 import openjii_auth
-import run_Calibratron as rc
-import gui_publish
+import run_calibratron as rc
 
 
 # ---------------------------------------------------------------------------
@@ -133,20 +170,6 @@ def check_firmware_folder(folder):
 # The application
 # ---------------------------------------------------------------------------
 
-def discover_roles():
-    helpers._invalidate_port_cache()
-    specs = {"ambit": ("hello\n", "NEW"), "par_ref": ("get_name\n", "Par_REF"),
-             "emit_led": ("get_name\n", "Emit_LED"), "dc": ("*IDN?\n", "KIPRIM")}
-    return {role: helpers.findDevice(question=q, answer=a, flush=True, timeout=4)
-            for role, (q, a) in specs.items()}
-
-
-def fit_status(record, upload):
-    if not record.get("quality", {}).get("passed"):
-        return "rejected"
-    return "written and verified" if upload else "preview"
-
-
 ROLES = ("ambit", "par_ref", "emit_led", "dc")
 ROLE_LABELS = {
     "ambit": "Ambit (device under calibration)",
@@ -170,15 +193,17 @@ class CalibratronGUI:
         self.settings = openjii_auth.Settings.load()
         #: Validated OpenJIIClient, or None while nobody is signed in.
         self.oj_client = None
+        #: Bumped per sign-in request so a stale validation can never win.
         self._auth_generation = 0
 
-        self._build_statusbar()
         self._build_left()
         self._build_right()
+        self._build_statusbar()
 
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         root.after(100, self._drain_queue)
         self._log_line("[gui] ready - press 'Rescan bench' to discover the instruments")
+        # The packaged smoke test builds the window with no network access.
         if auto_sign_in:
             self._sign_in_with_stored_key()
 
@@ -228,7 +253,7 @@ class CalibratronGUI:
                   justify="left").grid(row=3, column=1, columnspan=2, sticky="w")
 
         self.fw_tree = ttk.Treeview(fw, columns=("ok", "detail"), show="tree headings",
-                                    height=4)
+                                    height=6)
         self.fw_tree.heading("#0", text="file")
         self.fw_tree.heading("ok", text="ok")
         self.fw_tree.heading("detail", text="detail")
@@ -261,16 +286,16 @@ class CalibratronGUI:
         # Run
         run = ttk.LabelFrame(left, text="Calibrate this device", padding=6)
         run.pack(fill="x", pady=(8, 0))
-        self.opt_flash = tk.BooleanVar(value=True)
+        self.opt_flash = tk.BooleanVar(value=rc.FLASH_FIRMWARE)
         self.opt_force = tk.BooleanVar(value=rc.FORCE_FLASH_FIRMWARE)
-        self.opt_par = tk.BooleanVar(value=True)
-        self.opt_led = tk.BooleanVar(value=True)
-        self.opt_upload = tk.BooleanVar(value=rc.UPLOAD_GAINS)
-        self.opt_publish = tk.BooleanVar(value=False)
+        self.opt_tier3 = tk.BooleanVar(value=rc.CALIBRATE_TIER3)
+        self.opt_led = tk.BooleanVar(value=rc.CALIBRATE_LED)
+        self.opt_upload = tk.BooleanVar(value=rc.UPLOAD_COEFFICIENTS)
+        self.opt_publish = tk.BooleanVar(value=rc.PUBLISH_TO_OPENJII)
         for i, (text, var) in enumerate((
                 ("Flash firmware", self.opt_flash),
                 ("Force reflash of equivalent firmware", self.opt_force),
-                ("PAR sensor calibration (light_slope)", self.opt_par),
+                ("Tier-3 PAR calibration (par_slope, par_intercept)", self.opt_tier3),
                 ("Actinic LED calibration", self.opt_led),
                 ("Write coefficients to the device", self.opt_upload),
                 ("Publish the record to openJII", self.opt_publish)), start=0):
@@ -301,16 +326,16 @@ class CalibratronGUI:
         cur.columnconfigure(1, weight=1)
         cur.rowconfigure(1, weight=1)
 
-        par = ttk.LabelFrame(cur, text="PAR fit (reference PAR = gain × raw PAR)",
+        par = ttk.LabelFrame(cur, text="Tier-3 PAR fit (par = a·par_tier2 + b)",
                              padding=6)
         par.grid(row=0, column=0, rowspan=2, sticky="nsew", padx=(0, 6))
         par.columnconfigure(1, weight=1)
         par.rowconfigure(6, weight=1)
         self.par_vars = {}
         for i, (key, label) in enumerate((
-                ("status", "Status"), ("par_slope", "PAR gain"),
-                ("par_intercept", "Fit intercept (fixed)"), ("r2", "R²"),
-                ("nrmse", "NRMSE"), ("confirm", "QC reasons"))):
+                ("status", "Status"), ("par_slope", "par_slope"),
+                ("par_intercept", "par_intercept"), ("r2", "R²"),
+                ("nrmse", "NRMSE"), ("confirm", "Worst confirm error"))):
             ttk.Label(par, text=label + ":").grid(row=i, column=0, sticky="w")
             var = tk.StringVar(value="—")
             ttk.Label(par, textvariable=var).grid(row=i, column=1, sticky="w")
@@ -318,7 +343,7 @@ class CalibratronGUI:
         self.par_tree = ttk.Treeview(
             par, columns=("tier2", "ref", "used"), show="tree headings", height=9)
         self.par_tree.heading("#0", text="lamp A")
-        self.par_tree.heading("tier2", text="raw PAR")
+        self.par_tree.heading("tier2", text="par_tier2")
         self.par_tree.heading("ref", text="ref PAR")
         self.par_tree.heading("used", text="fitted")
         self.par_tree.column("#0", width=70, anchor="e")
@@ -327,7 +352,7 @@ class CalibratronGUI:
         self.par_tree.column("used", width=110, anchor="w")
         self.par_tree.grid(row=6, column=0, columnspan=2, sticky="nsew", pady=(6, 0))
 
-        led = ttk.LabelFrame(cur, text="Actinic LED fit (setting = gain × ref PAR)",
+        led = ttk.LabelFrame(cur, text="Actinic LED fit (ref PAR = c·setting)",
                              padding=6)
         led.grid(row=0, column=1, rowspan=2, sticky="nsew")
         led.columnconfigure(1, weight=1)
@@ -356,7 +381,7 @@ class CalibratronGUI:
         ses.rowconfigure(0, weight=1)
         cols = ("name", "mac", "fw", "slope", "intercept", "par_r2",
                 "led_coeff", "led_r2", "status")
-        heads = ("name", "MAC", "firmware", "PAR gain", "Fit intercept",
+        heads = ("name", "MAC", "firmware", "par_slope", "par_intercept",
                  "PAR R²", "LED coeff", "LED R²", "status")
         self.session_tree = ttk.Treeview(ses, columns=cols, show="tree headings")
         self.session_tree.heading("#0", text="#")
@@ -395,8 +420,8 @@ class CalibratronGUI:
                     self.log.configure(state="disabled")
                 elif kind == "devices":
                     self._show_devices(payload)
-                elif kind == "par":
-                    self._show_par(payload)
+                elif kind == "tier3":
+                    self._show_tier3(payload)
                 elif kind == "led":
                     self._show_led(payload)
                 elif kind == "session":
@@ -421,9 +446,9 @@ class CalibratronGUI:
         return openjii_auth.environment(self.oj_env.get())
 
     def _on_env_changed(self):
-        self._auth_generation += 1
         self.settings.environment = self.oj_env.get()
         self.settings.save()
+        self._auth_generation += 1
         self.oj_client = None
         self.oj_user.set("not signed in")
         self._sign_in_with_stored_key()
@@ -463,7 +488,12 @@ class CalibratronGUI:
 
     def _validate_key_async(self, key, quiet=False):
         """Validate off the main thread: this is a network round trip, and it
-        happens while the operator is mounting the next device."""
+        happens while the operator is mounting the next device.
+
+        Every request carries a generation number: a validation that completes
+        after the operator switched environment or started another sign-in is
+        stale and must not overwrite the newer state (see _show_signed_in).
+        """
         env = self._env()
         self._auth_generation += 1
         generation = self._auth_generation
@@ -487,7 +517,7 @@ class CalibratronGUI:
     def _show_signed_in(self, payload):
         generation, client, key = payload
         if generation != self._auth_generation or client.env.key != self.oj_env.get():
-            return
+            return                      # stale: a newer request superseded it
         self.oj_client = client
         self.settings.set_api_key(client.env.key, key)
         self.settings.environment = client.env.key
@@ -539,8 +569,8 @@ class CalibratronGUI:
         self._spawn(self._rescan_worker, "scanning the bench…")
 
     def _rescan_worker(self):
-        helpers._invalidate_port_cache()
-        ports = discover_roles()
+        helpers.invalidate_port_cache()
+        ports = helpers.discover_roles(helpers.DEVICE_SPECS)
         self.ports = ports
         _LOG_QUEUE.put(("devices", dict(ports)))
 
@@ -583,7 +613,8 @@ class CalibratronGUI:
                                 f"{report['version']}")
         elif report["files_ok"]:
             self.fw_verdict.set(f"all files present (firmware {report['version']}); "
-                                f"no verified release provenance - flashing blocked")
+                                f"no release provenance - flashable, and the "
+                                f"record will mark the source unverified")
         else:
             self.fw_verdict.set("INCOMPLETE - see the file list")
         self._log_line(f"[gui] firmware folder check: {folder} -> "
@@ -604,13 +635,6 @@ class CalibratronGUI:
         if not self._publish_preflight():
             return
         self._reset_device_views()
-        self.run_options = {
-            "par": self.opt_par.get(), "led": self.opt_led.get(),
-            "flash": self.opt_flash.get(), "force": self.opt_force.get(),
-            "upload": self.opt_upload.get(), "publish": self.opt_publish.get(),
-            "mode": self.fw_mode.get(), "folder": self.fw_folder.get().strip(),
-            "client": self.oj_client,
-        }
         self._spawn(self._run_device_worker, "calibrating…")
 
     def _publish_preflight(self):
@@ -669,10 +693,22 @@ class CalibratronGUI:
         # Re-checked at flash time, not trusted from the last button press: the
         # entry may have been edited, or the folder contents changed since.
         report = check_firmware_folder(folder)
-        if not report["verified"]:
-            raise RuntimeError("Local firmware must be a complete verified immutable release cache entry")
+        if not report["files_ok"]:
+            print("[flash] local folder is incomplete - not flashing")
+            return 1, None
         version = report["version"]
-        provenance = firmware_fetch.release_provenance(folder)
+        if report["verified"]:
+            provenance = firmware_fetch.release_provenance(folder)
+        else:
+            # Flashing is gated on image integrity (just proven above), not on
+            # provenance. The record says honestly where the firmware came from.
+            print("[flash] local folder has no verified release provenance - "
+                  "flashing anyway; the record marks the source unverified")
+            provenance = {"source": "local_folder",
+                          "path": os.path.abspath(folder),
+                          "version": version,
+                          "immutable": False, "verified": False,
+                          "flash": report["entries"]}
         decision = firmware_fetch.flash_decision(current_version, version,
                                                  force=force, allow_downgrade=False)
         if decision in ("equivalent", "newer", "unknown"):
@@ -680,119 +716,231 @@ class CalibratronGUI:
                   f"{version!r} - skipping flash")
             return 0, provenance
         print(f"[flash] {decision}: {current_version!r} -> {version!r} (local folder)")
-        if not helpers.flash_ambit_firmware(folder):
+        port = self.ports["ambit"]
+        if not helpers.flash_ambit_firmware(folder, port=port):
             raise RuntimeError("Local firmware flash did not complete")
         time.sleep(1.0)
-        helpers._invalidate_port_cache()
-        running = rc._detect_ambit_version()
+        helpers.invalidate_port_cache()
+        # A local folder has no release pipeline behind it, so the only proof
+        # that the intended image is now running is the device's own banner.
+        running = helpers.ambit_reboot(port).firmware
         try:
             verified = firmware_fetch.compare_device_versions(running, version) == 0
         except (TypeError, ValueError):
             verified = False
         if not verified:
-            raise RuntimeError(f"Local firmware readback mismatch: running {running!r}, "
-                               f"expected device-visible {firmware_fetch.device_visible_version(version)!r}")
+            raise RuntimeError(
+                f"Local firmware readback mismatch: running {running!r}, expected "
+                f"device-visible {firmware_fetch.device_visible_version(version)!r}")
         print(f"[flash] verified device-equivalent firmware {running}")
         return 0, provenance
 
     def _run_device_worker(self):
-        options = self.run_options
-        ports = discover_roles()
+        # 1. Discover (fresh every run: the Ambit was just swapped).
+        helpers.invalidate_port_cache()
+        ports = helpers.discover_roles(helpers.DEVICE_SPECS)
         self.ports = ports
         _LOG_QUEUE.put(("devices", dict(ports)))
-        required = {"ambit": True, "par_ref": options["par"],
-                    "dc": options["par"], "emit_led": options["led"]}
-        missing = [role for role, needed in required.items() if needed and not ports[role]]
+
+        port_ambit = ports["ambit"]
+        if port_ambit is None:
+            raise RuntimeError("no Ambit found - is the device seated in the "
+                               "flasher fixture?")
+        needed = {"par_ref": self.opt_tier3.get(), "dc": self.opt_tier3.get(),
+                  "emit_led": self.opt_led.get()}
+        missing = [r for r, need in needed.items() if need and not ports.get(r)]
         if missing:
-            raise RuntimeError("Missing bench instruments: " + ", ".join(missing))
-        port = ports["ambit"]
-        before = helpers.ambit_reboot(port)
-        current_name = before.name.decode(errors="replace").strip()
-        current_fw = before.FW.decode(errors="replace").strip()
+            raise RuntimeError("missing bench instruments for the selected steps: "
+                               + ", ".join(missing))
+
+        # 2. As-received state.
+        info_asreceived = helpers.ambit_reboot(port_ambit)
+        print(info_asreceived)
+        fw_asreceived = info_asreceived.firmware
+        current_name = info_asreceived.device_name
+
+        # 2b. Ask for the name now, before the long unattended steps, so the
+        # only interactive pause in a run is at its very start. The rename
+        # itself waits until after the flash (step 4) - flashing can clear it.
         new_name = self._ask_device_name(current_name)
+        if new_name is None:
+            print(f"[name] keeping the current name {current_name!r}")
+
+        # 3. Firmware.
         provenance = None
-        if options["flash"]:
-            if options["mode"] == "local":
-                _, provenance = self._flash_local(options["folder"], current_fw, options["force"])
+        if self.opt_flash.get():
+            print("\n=== Firmware ===")
+            force = self.opt_force.get()
+            if force:
+                print("WARNING: force - equivalent firmware may be re-flashed "
+                      "or an unresponsive device recovered")
+            if self.fw_mode.get() == "local":
+                rc_code, provenance = self._flash_local(
+                    self.fw_folder.get().strip(), fw_asreceived or None, force)
             else:
-                rc._firmware_release_provenance = None
-                result = rc.flash_firmware(force_flash=options["force"], current_version=current_fw)
-                if result:
-                    raise RuntimeError("Could not obtain or verify firmware; calibration was not started")
-                provenance = rc._firmware_release_provenance
-            ports = discover_roles()
-            self.ports = ports
-            _LOG_QUEUE.put(("devices", dict(ports)))
-            port = ports["ambit"]
-            if not port:
-                raise RuntimeError("Ambit did not return after firmware check")
-            before = helpers.ambit_reboot(port)
+                rc_code, provenance = rc.flash_firmware(
+                    port_ambit, force=force, current_version=fw_asreceived or None,
+                    allow_downgrade=rc.ALLOW_FIRMWARE_DOWNGRADE)
+            if rc_code != 0:
+                print("[flash] continuing with the firmware already on the device")
+            else:
+                ports = helpers.discover_roles(helpers.DEVICE_SPECS)
+                self.ports = ports
+                _LOG_QUEUE.put(("devices", dict(ports)))
+                port_ambit = ports["ambit"] or port_ambit
+
+        info_before = helpers.ambit_reboot(port_ambit)
+
+        # 4. Name (asked for at step 2b, applied here: after any flash).
         if new_name and new_name != current_name:
-            helpers.set_ambit_name(port, new_name)
-        par_cal = led_cal = None
-        if options["par"]:
-            par_cal = rc.calibrate_par_sensor(port, ports["par_ref"], ports["dc"],
-                                              upload=options["upload"], show_plot=False)
-            _LOG_QUEUE.put(("par", (par_cal, options["upload"])))
-        if options["led"]:
-            led_cal = rc.calibrate_led(port, ports["emit_led"],
-                                      upload=options["upload"], show_plot=False)
-        after = helpers.ambit_reboot(port)
-        if led_cal is not None:
-            display = dict(led_cal, act_led_coeff_before=before.act_led_coeff,
-                           act_led_coeff_after=after.act_led_coeff)
-            _LOG_QUEUE.put(("led", (display, options["upload"])))
+            helpers.set_ambit_name(port_ambit, new_name)
+            print(f"[name] {current_name!r} -> {new_name!r}")
+
+        # 5. Reference snapshots.
+        port_ref, port_emit = ports.get("par_ref"), ports.get("emit_led")
+        port_dc = ports.get("dc")
+        reference = helpers.read_minipar_reference(port_ref) if port_ref else None
+        reference_emit = (helpers.read_minipar_reference(port_emit)
+                          if port_emit else None)
+
+        # 6. Tier-3 PAR.
+        tier3_cal = None
+        if self.opt_tier3.get():
+            print("\n=== Tier-3 PAR calibration (par_slope, par_intercept) ===")
+            tier3_cal = rc.calibrate_tier3(port_ambit, port_ref, port_dc,
+                                           reference=reference,
+                                           upload=self.opt_upload.get())
+            _LOG_QUEUE.put(("tier3", tier3_cal))
+
+        # 7. Actinic LED.
+        led_cal = None
+        if self.opt_led.get():
+            print("\n=== Actinic LED calibration ===")
+            led_cal = rc.calibrate_led(port_ambit, port_emit,
+                                       current_coeff=info_before.act_led_coeff,
+                                       upload=self.opt_upload.get())
+            _LOG_QUEUE.put(("led", led_cal))
+
+        # 8. Final state, record, publish - same shape as run_calibratron.main().
+        print("\n=== Ambit after calibration ===")
+        info_after = helpers.ambit_reboot(port_ambit)
+        print(info_after)
+        try:
+            final_cal = helpers.get_spec_cal(port_ambit)
+            print(f"Spectral/PAR cal: par_slope={final_cal.par_slope:.6g}, "
+                  f"par_intercept={final_cal.par_intercept:.6g}, "
+                  f"seed_match={final_cal.seed_match()}")
+        except Exception as exc:
+            print(f"[readback] spectral/PAR calibration unreadable: {exc}")
+            final_cal = None
+
+        print("\n=== Calibration record ===")
+        import spec_cal
+        import quality
         payload = helpers.make_calibration_payload(
-            before, after, par_cal=par_cal, led_cal=led_cal,
-            firmware_release_provenance=provenance)
-        path = rc.save_payload(payload, mac=after.MAC)
-        if options["publish"]:
+            info_before, info_after,
+            spec_par_cal=tier3_cal, led_cal=led_cal, baseline_cal=None,
+            protocol_id=rc.OJII_PROTOCOL_ID,
+            station={
+                "firmware_as_received": fw_asreceived,
+                "firmware_release_provenance": provenance,
+                "par_reference": reference,
+                "led_reference": reference_emit,
+                "spec_cal_final": final_cal.to_dict() if final_cal else None,
+                "ambit_spec_channels": list(spec_cal.CHANNELS),
+                "seed_generation": spec_cal.SEED_GENERATION,
+                "adpd_traces": ({"channels": list(quality.ARRUN_CHANNELS),
+                                 "pulses": rc.ARRUN_PULSES,
+                                 "freq_hz": rc.ARRUN_FREQ_HZ,
+                                 "pulse_leds": "zeroing requested before every trace",
+                                 "pulse_leds_zeroed_confirmed":
+                                     rc._pulse_leds_confirmed(tier3_cal, led_cal),
+                                 "stored": "per-point statistics and trace "
+                                           "provenance only; raw pulse samples "
+                                           "are discarded",
+                                 "purpose": "recorded for later analysis; nothing "
+                                            "is fitted or written from them"}
+                                if rc.RECORD_ADPD_TRACES else None),
+                "calibrated_here": ["par_slope", "par_intercept"],
+                "shipped_as_firmware_defaults": ["spec_offset", "spec_sens",
+                                                 "par_weight"],
+                "operator_frontend": "calibratron_gui",
+            })
+        path = helpers.save_payload(payload, mac=info_after.MAC,
+                                    directory=rc.CALIBRATIONS_DIR)
+
+        if self.opt_publish.get():
             try:
-                client = options["client"]
-                gui_publish.publish_payload_mqtt5_wss(
-                    payload,
-                    topic="experiment/data_ingest/v1/993ae58e-2e87-45ef-96e1-5bbdb0916817/ambit/v1.0/ambit_calibration_1/1234556",
-                    endpoint=client.env.mqtt_host, credentials=client.iot_credentials(),
-                    client_id="ambit_calibration_1")
+                # The window signed in; the run just borrows that session.
+                rc.publish_to_openjii(payload, client=self.oj_client)
+                print("[publish] uploaded to openJII")
             except Exception as exc:
-                print(f"[publish] upload failed ({exc}); record saved at {path}")
+                print(f"[publish] openJII upload failed ({exc}); the calibration "
+                      f"is saved at {path}")
+        else:
+            print("[publish] publishing disabled - record saved locally only")
+
+        # 9. Session summary row.
+        t3_fit = (tier3_cal or {}).get("fit") or {}
+        led_fit = (led_cal or {}).get("fit") or {}
         _LOG_QUEUE.put(("session", {
-            "name": new_name or current_name, "mac": after.MAC,
-            "fw": after.FW.decode(errors="replace").strip(),
-            "slope": _fmt((par_cal or {}).get("slope")), "intercept": "0",
-            "par_r2": _fmt((par_cal or {}).get("r2")),
-            "led_coeff": _fmt((led_cal or {}).get("slope")),
-            "led_r2": _fmt((led_cal or {}).get("r2")),
-            "status": "; ".join(f"{name}: {fit_status(cal, options['upload'])}"
-                                for name, cal in (("PAR", par_cal), ("LED", led_cal))
-                                if cal is not None) or "saved",
+            "name": new_name or current_name,
+            "mac": info_after.MAC,
+            "fw": info_after.firmware,
+            "slope": _fmt(t3_fit.get("par_slope")),
+            "intercept": _fmt(t3_fit.get("par_intercept")),
+            "par_r2": _fmt(t3_fit.get("r2"), 6),
+            "led_coeff": _fmt(led_fit.get("coefficient")),
+            "led_r2": _fmt(led_fit.get("r2"), 6),
+            "status": "; ".join(filter(None, (
+                (tier3_cal or {}).get("status"),
+                "LED written" if (led_cal or {}).get("uploaded") else None))) or "ran",
         }))
-        print(f"[gui] device done; record saved at {path}")
+        print(f"\n[gui] device done - swap the next Ambit into the fixture "
+              f"and press Start again")
 
-    def _show_par(self, result):
-        record, upload = result
-        quality = record.get("quality") or {}
-        self.par_vars["status"].set(fit_status(record, upload))
-        self.par_vars["par_slope"].set(_fmt(record.get("slope")))
-        self.par_vars["par_intercept"].set("0")
-        self.par_vars["r2"].set(_fmt(record.get("r2")))
-        self.par_vars["nrmse"].set(_fmt(quality.get("nrmse")))
-        self.par_vars["confirm"].set("; ".join(quality.get("reasons", [])) or "passed")
+    # ---- results rendering ---------------------------------------------------
+
+    def _show_tier3(self, record):
+        fit = record.get("fit") or {}
+        self.par_vars["status"].set(record.get("status") or "—")
+        self.par_vars["par_slope"].set(_fmt(fit.get("par_slope")))
+        self.par_vars["par_intercept"].set(_fmt(fit.get("par_intercept")))
+        self.par_vars["r2"].set(_fmt(fit.get("r2"), 6))
+        self.par_vars["nrmse"].set(_fmt(fit.get("nrmse"), 4))
+        worst = record.get("confirmation_worst_rel_error")
+        self.par_vars["confirm"].set("—" if worst is None else f"{worst:+.2%}")
         self.par_tree.delete(*self.par_tree.get_children())
-        for current, raw, ref in zip(record["currents_A"], record["x"], record["y"]):
-            self.par_tree.insert("", "end", text=_fmt(current),
-                                 values=(_fmt(raw), _fmt(ref), "yes"))
+        for point in record.get("sweep") or []:
+            tier2 = ((point.get("ambit") or {}).get("par_tier2"))
+            used = "yes" if point.get("usable") else \
+                "; ".join(point.get("rejected_because") or ["no"])
+            self.par_tree.insert("", "end", text=_fmt(point.get("current_A"), 3),
+                                 values=(_fmt(tier2), _fmt(point.get("ref_par")),
+                                         used))
+        for point in record.get("confirmation") or []:
+            rel = point.get("rel_error")
+            self.par_tree.insert("", "end", text=_fmt(point.get("current_A"), 3),
+                                 values=(_fmt((point.get("ambit") or {}).get("par")),
+                                         _fmt(point.get("ref_par")),
+                                         "confirm " + ("—" if rel is None
+                                                       else f"{rel:+.2%}")))
 
-    def _show_led(self, result):
-        record, upload = result
-        self.led_vars["status"].set(fit_status(record, upload))
-        self.led_vars["coefficient"].set(_fmt(record.get("slope")))
-        self.led_vars["r2"].set(_fmt(record.get("r2")))
+    def _show_led(self, record):
+        fit = record.get("fit") or {}
+        status = record.get("status") or ("written and verified"
+                                          if record.get("uploaded") else
+                                          ("rejected" if fit and not fit.get("passed")
+                                           else "preview"))
+        self.led_vars["status"].set(status)
+        self.led_vars["coefficient"].set(_fmt(fit.get("coefficient")))
+        self.led_vars["r2"].set(_fmt(fit.get("r2"), 6))
         self.led_vars["before"].set(_fmt(record.get("act_led_coeff_before")))
         self.led_vars["after"].set(_fmt(record.get("act_led_coeff_after")))
         self.led_tree.delete(*self.led_tree.get_children())
-        for ref, setting in zip(record["x"], record["y"]):
-            self.led_tree.insert("", "end", text=_fmt(setting), values=(_fmt(ref),))
+        for setting, ref in zip(record.get("led_settings") or [],
+                                record.get("ref_par") or []):
+            self.led_tree.insert("", "end", text=str(setting), values=(_fmt(ref, 2),))
 
     def _add_session_row(self, row):
         self.session_rows += 1
@@ -810,6 +958,12 @@ class CalibratronGUI:
                     "Calibratron", "A calibration is still running. Close anyway?\n"
                                    "(The lamp/LED may be left driven.)"):
                 return
+        cache = rc.FIRMWARE_CACHE_DIR
+        # Only ever the runner's own download cache - never a user-selected
+        # local firmware folder.
+        if os.path.basename(cache) == "firmware_cache" and os.path.isdir(cache):
+            shutil.rmtree(cache, ignore_errors=True)
+            print(f"[gui] deleted the firmware cache: {cache}")
         self.root.destroy()
 
 

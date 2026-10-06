@@ -1,36 +1,54 @@
-"""
-Helper functions for Ambit calibration and PAR measurements.
+"""Transport and device I/O for the new Calibratron.
 
-This module contains utilities for:
-- Serial device communication and discovery
-- PAR (Photosynthetically Active Radiation) measurements
-- Data analysis and visualization
-- Device calibration
+Serial discovery, the Ambit binary + text consoles, the bench reference
+instruments, and the calibration record. The tier math and the quality gates
+live in :mod:`spec_cal`; the bench sequence lives in :mod:`run_calibratron`.
+
+Deliberately dropped from the previous helpers.py, because the cmd-35 chain
+replaces them rather than sitting alongside them:
+
+  - ``get_par_AMB`` / cmd 31 / text ``get_par`` and ``PAR`` - the legacy PAR path.
+    Integer ``Spec_COE`` weights on un-normalised counts at a pinned exposure,
+    packed into a uint16 that wraps above ~11% of full scale.
+  - ``set_par_gain`` / ``set_spec`` / ``spec_coef``. Still read and recorded
+    (cmd 31 and deployed devices depend on it), never written - plan decision 7.
+  - ``ambit_spec_unscale``, ``ambit_par_minipar_method``,
+    ``AMBIT_PAR_DISCREPANCIES``. All three existed to characterise the mismatch
+    between the legacy weighting and the MiniPAR's. Ambit now *ships* miniPar's
+    fleet vector, so the mismatch they measured is gone.
+  - ``basic_count_divisor`` in the seconds convention. Replaced by
+    ``spec_cal.integration_time_ms``; the two differ by 1000x.
+  - The arrun / ADPD trace recording per sweep point (diagnostic only, and it
+    roughly doubled both sweeps). ``measure_adpd_baseline`` is kept - that one
+    persists a calibration.
 """
 
-import os
-import re
-import sys
-import time
+from __future__ import annotations
+
+import glob
+import hashlib
+import importlib.util
 import json
 import logging
+import os
+import re
+import subprocess
+import sys
+import time
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+
 import serial
 import serial.tools.list_ports
-import subprocess
-import importlib.util
-import glob
-from pathlib import Path
-from datetime import datetime, timezone
-from dataclasses import dataclass, field
-from matplotlib import pyplot as plt
-import numpy as np
 
+import runtime_paths
+import spec_cal
 
 class _UnicodeSafeHandler(logging.StreamHandler):
-    """StreamHandler that falls back to ASCII+backslashreplace when the
-    underlying stream's encoding (e.g. Windows cp1252) can't render a char.
-    Without this, a stray byte like 0x80 in serial output crashes the logger.
-    """
+    """StreamHandler that falls back to ASCII+backslashreplace when the stream's
+    encoding (e.g. Windows cp1252) can't render a char. Without this a stray
+    byte in serial output crashes the logger."""
+
     def emit(self, record):
         try:
             msg = self.format(record) + self.terminator
@@ -43,7 +61,7 @@ class _UnicodeSafeHandler(logging.StreamHandler):
             self.handleError(record)
 
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("calibratron")
 if not logger.handlers:
     _h = _UnicodeSafeHandler(sys.stdout)
     _h.setFormatter(logging.Formatter("[%(name)s] %(message)s"))
@@ -52,225 +70,331 @@ if not logger.handlers:
     logger.propagate = False
 
 
-# ============================================================================
-# Time helpers
-# ============================================================================
+HERE = os.path.dirname(os.path.abspath(__file__))
+#: Writable storage: this folder from a source checkout, the per-user data
+#: directory from the packaged app (see runtime_paths.data_dir).
+DATA_DIR = str(runtime_paths.data_dir())
+BAUDRATE = 115200
+
 
 def iso_timestamp():
-    """Return the current UTC time as an ISO 8601 / RFC 3339 string with
-    millisecond precision and a trailing 'Z', e.g. ``'2025-09-16T10:45:21.861Z'``.
-    """
+    """UTC ISO 8601 with millisecond precision and a trailing Z."""
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
 # ============================================================================
-# Device Discovery & Communication
+# Discovery
 # ============================================================================
 
-_PORTS_CACHE: "list | None" = None
+_PORTS_CACHE = None
+_PORT_INFO_CACHE = None
+
+PORT_ROLE_CACHE_FILE = os.path.join(DATA_DIR, ".port_roles.json")
 
 
-def _invalidate_port_cache():
-    """Clear the cached serial port list. Call after USB topology changes."""
-    global _PORTS_CACHE
+def invalidate_port_cache():
+    """Clear the cached serial port list. Call after a USB topology change."""
+    global _PORTS_CACHE, _PORT_INFO_CACHE
     _PORTS_CACHE = None
+    _PORT_INFO_CACHE = None
+
+
+def port_infos():
+    """pyserial ``ListPortInfo`` for every port the OS reports, memoised."""
+    global _PORT_INFO_CACHE
+    if _PORT_INFO_CACHE is None:
+        _PORT_INFO_CACHE = sorted(serial.tools.list_ports.comports(),
+                                  key=lambda p: p.device)
+    return list(_PORT_INFO_CACHE)
 
 
 def serial_ports():
-    """
-    Lists available serial port names for the current platform.
-
-    Memoised after the first call. Call _invalidate_port_cache() if devices
-    have been hot-plugged since the last scan.
-
-    :raises EnvironmentError: On unsupported or unknown platforms
-    :returns: A list of the serial ports available on the system
-    """
+    """Available port names, from the OS enumeration rather than by probing."""
     global _PORTS_CACHE
-    if _PORTS_CACHE is not None:
-        return list(_PORTS_CACHE)
-
-    if sys.platform.startswith('win'):
-        ports = ['COM%s' % (i + 1) for i in range(256)]
-    elif sys.platform.startswith('linux') or sys.platform.startswith('cygwin'):
-        ports = glob.glob('/dev/tty[A-Za-z]*')
-    elif sys.platform.startswith('darwin'):
-        ports = glob.glob('/dev/tty.*')
-    else:
-        raise EnvironmentError('Unsupported platform')
-
-    result = []
-    for port in ports:
-        try:
-            s = serial.Serial(port)
-            s.close()
-            result.append(port)
-        except (OSError, serial.SerialException):
-            pass
-    _PORTS_CACHE = result
-    return list(result)
+    if _PORTS_CACHE is None:
+        _PORTS_CACHE = [p.device for p in port_infos()]
+    return list(_PORTS_CACHE)
 
 
-def findDevice(question="hello\r\n", answer="", flush=True, timeout=5, verbose=False):
+def find_devices(specs, timeout=4.0, poll=0.25, ports=None, verbose=False):
+    """Discover several serial devices in ONE pass over the available ports.
+
+    Opens each port once, sends every still-unmatched question on each poll, and
+    stops probing a port as soon as one role matches - a device only ever fills
+    one role. Cost is roughly one ``timeout`` per unidentified port, whatever the
+    number of roles.
+
+    :param specs: ``{role: (question, answer)}``; ``answer`` is matched as a
+        substring of everything the port has said so far
+    :return: ``{role: port or None}`` for every role in ``specs``
     """
-    Find Ambit device on available serial ports by handshake.
+    pending = dict(specs)
+    found = {}
+    unopenable = []
 
-    Attempts to find a device by sending a 'question' string and looking for
-    an 'answer' substring in the response.
-
-    :param question: The message to send to the device (default: "hello")
-    :param answer: The substring expected in the device response
-    :param flush: Whether to flush the serial buffer before sending (default: True)
-    :param timeout: The read timeout for the serial port in seconds (default: 5)
-    :param verbose: When True, log the full handshake response (boot log and
-        all); otherwise only the port that matched is reported (default: False)
-    :return: The port where the device was found, or None if not found
-    """
-    for port in serial_ports():
+    scanned = serial_ports() if ports is None else list(ports)
+    for port in scanned:
+        if not pending:
+            break
         try:
-            with serial.Serial(port, baudrate=115200, timeout=0.2) as ser:
+            with serial.Serial(port, baudrate=BAUDRATE, timeout=0.2) as ser:
                 # Asserting DTR/RTS reboots devices like the ESP32-C3, so the
                 # first thing we see is the boot log, not the handshake reply.
                 ser.dtr = True
                 ser.rts = True
-
-                if flush:
-                    ser.reset_input_buffer()
-                    ser.reset_output_buffer()
-
-                # Give the DTR/RTS-triggered reboot a moment to start, then keep
-                # re-sending the question and accumulating output until the
-                # answer shows up or we run out of time. A single short read
-                # would only catch the boot log and miss the (later) reply.
+                ser.reset_input_buffer()
+                ser.reset_output_buffer()
                 time.sleep(0.3)
+
+                msg, matched = "", None
                 deadline = time.time() + timeout
-                msg = ""
-                while time.time() < deadline:
-                    ser.write(question.encode())
-                    time.sleep(0.3)
-                    msg_bytes = ser.read_all()
-                    # Decode with unicode_escape for special characters; fall
-                    # back to replacing undecodable bytes (e.g. reset framing
-                    # noise) so a stray byte never aborts the scan.
+                while time.time() < deadline and matched is None:
+                    for question, _answer in pending.values():
+                        ser.write(question.encode())
+                    time.sleep(poll)
+                    chunk = ser.read_all() or b""
                     try:
-                        msg += msg_bytes.decode(encoding='unicode_escape')
+                        msg += chunk.decode(encoding="unicode_escape")
                     except Exception:
-                        msg += msg_bytes.decode(errors='replace')
+                        msg += chunk.decode(errors="replace")
+                    for role, (_question, answer) in pending.items():
+                        if answer and answer in msg:
+                            matched = role
+                            break
 
-                    if answer and answer in msg:
-                        if verbose:
-                            logger.info("Found device at: %s, answer: %s", port, msg)
-                        else:
-                            logger.info("Found device at: %s", port)
-                        return port
-
-                # No match on this port. Surface what it *did* say when verbose
-                # is on (otherwise this stays at debug level and is hidden), so
-                # the full response is visible even when the answer never shows.
-                if verbose:
+                if matched is not None:
+                    logger.info("Found %s at: %s", matched, port)
+                    found[matched] = port
+                    del pending[matched]
+                elif verbose:
                     logger.info("No match on %s. Received: %s", port, msg.strip())
-                else:
-                    logger.debug("Received message: %s, port: %s", msg.strip(), port)
-        except (OSError, serial.SerialException) as e:
-            logger.debug("Cannot open %s: %s", port, e)
-            _invalidate_port_cache()
+        except (OSError, serial.SerialException) as exc:
+            # A warning, not a debug line: a bench instrument that is plugged in
+            # but whose port will not open looks *identical* to one that is
+            # unplugged, and the operator can act on the difference (another
+            # process holding it, a driver that dropped out, a power-cycled USB
+            # bridge). Silence here is what makes a missing role a mystery.
+            logger.warning("Cannot open %s (skipped): %s", port, exc)
+            unopenable.append(port)
+            invalidate_port_cache()
             continue
 
-    logger.warning("No matching device found")
-    return None
+    for role in pending:
+        question = specs[role][0].strip()
+        # The port *names* matter more than the count: a role missing because the
+        # instrument's port never enumerated looks nothing like a role missing
+        # because the instrument did not answer, and only the list distinguishes
+        # them. Windows hands out whatever port number it likes, so "the one I
+        # expected is absent" is the operator's call to make, not this code's.
+        logger.warning("No device found for role %r: asked %r on %s",
+                       role, question, ", ".join(scanned) or "no ports at all")
+        if unopenable:
+            logger.warning("  %d port(s) could not be opened at all: %s",
+                           len(unopenable), ", ".join(unopenable))
+        found[role] = None
+    return found
+
+
+def load_port_roles(path=PORT_ROLE_CACHE_FILE):
+    """Read the role -> port hints written by :func:`save_port_roles`."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        return {str(k): str(v) for k, v in data.items() if v}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_port_roles(roles, path=PORT_ROLE_CACHE_FILE):
+    """Persist role -> port hints, merged over whatever is already stored."""
+    merged = load_port_roles(path)
+    merged.update({k: v for k, v in roles.items() if v})
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(merged, f, indent=2, sort_keys=True)
+    except OSError as exc:
+        logger.debug("Could not write port role cache %s: %s", path, exc)
+
+
+def discover_roles(specs, timeout=4.0, hint_timeout=1.5, use_cache=True,
+                   cache_path=PORT_ROLE_CACHE_FILE, verbose=False):
+    """Resolve ``{role: (question, answer)}`` to ``{role: port}``, cache-first.
+
+    The bench peripherals stay plugged in while Ambits are swapped, so on the
+    second device onwards this is three quick confirmations plus a scan for the
+    one port that moved.
+    """
+    found, remaining = {}, dict(specs)
+
+    if use_cache:
+        hints = load_port_roles(cache_path)
+        present = set(serial_ports())
+        for role in list(remaining):
+            port = hints.get(role)
+            if port is None or port not in present or port in found.values():
+                continue
+            hit = find_devices({role: remaining[role]}, timeout=hint_timeout,
+                               ports=[port], verbose=verbose)
+            if hit.get(role):
+                found[role] = hit[role]
+                del remaining[role]
+        if found:
+            logger.info("Confirmed from cache: %s",
+                        ", ".join(f"{r}={p}" for r, p in sorted(found.items())))
+
+    if remaining:
+        claimed = set(found.values())
+        rest = [p for p in serial_ports() if p not in claimed]
+        found.update(find_devices(remaining, timeout=timeout, ports=rest, verbose=verbose))
+
+    save_port_roles(found, cache_path)
+    return found
 
 
 # ============================================================================
-# Protocol Constants & Low-Level Helpers
+# Protocols
 # ============================================================================
-
-BAUDRATE = 115200
-
 
 class AmbitProto:
-    """Wire protocol for the Ambit device."""
-    HELLO       = "hello\r\n"
-    HELLO_ACK   = b"NEW"
-    REBOOT      = "reboot\n"
-    GET_PAR_RAW = "get_par\n"
-    GET_PAR_CAL = "PAR\n"
-    SET_SPEC    = "set_spec, {coeff:.4f}\n"
-    SET_ACT     = "set_act, {coeff:.4f}\n"
-    MEASURE_BASELINE = "baseline,0\n"
-    SET_BASELINE = "set_baseline,{values}\n"
-    SET_NAME    = "set_name,{name}\n"
-    LED_RUN     = "arrun1,1,1,2,0,0,1,0,1,{led:d},1,\n, \n"
+    """Wire protocol for the Ambit device.
+
+    Text verbs for the five spectral/PAR vectors come from plan section 6.6: the
+    console is what the Calibratron speaks, it reports accept/reject explicitly,
+    and binary cmds 17/18 write *nothing* on an unrecognised subtype - costing an
+    old image a full read timeout, and for cmd 18 desyncing the next header scan
+    because the payload is never consumed.
+
+    Only ``SET_PAR_SLOPE`` and ``SET_PAR_ICEPT`` are ever sent by this script.
+    ``set_spec_offset`` / ``set_spec_sens`` / ``set_par_weight`` are listed for
+    completeness and are deliberately absent: those three ship as firmware
+    defaults (plan section 7) and a per-device tier-2 fit scores R^2 -31..-7443.
+    """
+
+    HELLO      = "hello\r\n"
+    HELLO_ACK  = b"NEW"
+    REBOOT     = "reboot\n"
+    SET_NAME   = "set_name,{name}\n"
+
+    # tier 3 - the Calibratron's entire calibration output for the PAR chain.
+    # The device answers each setter with exactly one of three lines
+    # (src/do_command.h report_spec_save):
+    #     "<what> saved and verified"          -> committed to NVS and read back
+    #     "<what> rejected"                    -> failed the predicate, NVS untouched
+    #     "<what> save failed: <ESP_ERR_...>"  -> predicate passed, NVS write failed
+    # The third is the one that matters: it contains neither "rejected" nor any
+    # other negative keyword, so a host testing only for rejection reads an NVS
+    # failure as a success. Acceptance is therefore tested POSITIVELY.
+    SET_PAR_SLOPE = "set_par_slope,{value:.6f}\n"
+    SET_PAR_ICEPT = "set_par_icept,{value:.6f}\n"
+    GET_SPEC_CAL  = "get_spec_cal\n"
+
+    #: The only reply that means the value reached NVS.
+    SAVE_CONFIRMED = "saved and verified"
+
+    #: ``set_currents`` echo, from the firmware's own printf. Matched as a prefix
+    #: so the values it reports back stay available for logging.
+    CURRENTS_ACK = "Currents set"
+
+    # actinic LED (unrelated to the PAR chain, still a live calibration)
+    SET_ACT      = "set_act, {coeff:.4f}\n"
     SET_CURRENTS = "set_currents,{i620:d},{i720:d},{ir:d},\n"
-    # one type-2 line (no IR reflect), far-red off, sample number / frequency
-    # as hi,lo bytes, actinic setting, ambient channels at every point
-    ARRUN2       = "arrun2,1,0,2,0,{nh:d},{nl:d},{fh:d},{fl:d},{act:d},1,\n, \n"
+    # The trailing padding is "\n,\n" and NOT "\n, \n". That space was the
+    # whole bug behind six BAD COMMANDs a run. The device's command reader
+    # (Serial_Input_Chars(choose, ":,", 200) in ambit/src/ambit-1.ino) *skips* CR/LF
+    # without storing them, but a space is printable: it is stored as token byte 0
+    # and it restarts a 200 ms inter-character window. Whatever the host sends
+    # inside that window is appended to it, so "set_currents,0,0,0," arrives as the
+    # token " set_currents" - and do_command() silently drops any token whose first
+    # character fails isalnum(). The verb is gone; its three "0" arguments are then
+    # read as commands, and a digit-leading token goes through atoi into a switch
+    # with no numeric cases at all: BAD COMMAND, three times over.
+    # Without the space the padding stores nothing, so no window opens.
+    LED_RUN      = "arrun1,1,1,2,0,0,1,0,1,{led:d},1,\n,\n"
+
+    # ADPD photodiode trace. Type 2 (no IR reflect), far-red off, sample count
+    # and frequency as hi,lo byte pairs, actinic setting, then the trailing 1 that
+    # sets ambient sub-sampling to every point - which is the only reason `sun`
+    # and `leaf` get populated at all.
+    ARRUN2       = "arrun2,1,0,2,0,{nh:d},{nl:d},{fh:d},{fl:d},{act:d},1,\n,\n"
+
+    # ADPD dark baseline
+    MEASURE_BASELINE = "baseline,0\n"
+    SET_BASELINE     = "set_baseline,{values}\n"
 
 
 class MiniParProto:
-    """Wire protocol for the MiniPAR device."""
-    GET_PAR_RAW  = "par_raw\n"
-    GET_PAR_CAL  = "par\n"
-    GET_SPEC_RAW = "spec_raw\n"
-    GET_NAME     = "get_name\n"
-    SET_NAME     = "set_name,{name}\n"
+    """Wire protocol for the MiniPAR. Plain text, one bare line per reply."""
+
+    GET_PAR_CAL   = "par\n"             # par_raw * slope + intercept
+    GET_PAR_RAW   = "par_raw\n"         # before slope/intercept
+    GET_SPEC_RAW  = "spec_raw\n"        # "<model>,<raw counts...>", ends clear,nir
+    SPEC_STATUS   = "spec_status\n"
+    GET_SPEC_COEF = "get_spec_coeff\n"
+    GET_CAL_PAR   = "get_cal_par\n"
+    GET_NAME      = "get_name\n"
 
 
 class DCSourceProto:
     """Wire protocol for the Kiprim DC source."""
+
     SET_VOLTAGE = "voltage {v:.3f}\r\n"
     SET_CURRENT = "current {i:.3f}\r\n"
     IDN         = "*IDN?\n"
 
 
-def _query(port, cmd, decode="utf-8"):
-    """Open, flush, write, readline. Returns decoded+stripped response."""
-    with serial.Serial(port, baudrate=BAUDRATE) as ser:
-        ser.flush()
-        ser.write(cmd.encode())
-        return ser.readline().decode(encoding=decode).strip()
+#: Handshakes that identify each instrument on the bus.
+DEVICE_SPECS = {
+    "ambit":    (AmbitProto.HELLO,        "NEW"),
+    "par_ref":  (MiniParProto.GET_NAME,   "Par_REF"),
+    "emit_led": (MiniParProto.GET_NAME,   "Emit_LED"),
+    "dc":       (DCSourceProto.IDN,       "KIPRIM"),
+}
+
+#: Ambit firmware >= 0.1.0 answers ``hello`` with "NEW <name> Ready FW:<version>".
+HELLO_FW_RE = re.compile(r"FW:\s*([0-9]+(?:\.[0-9]+){2}(?:-[0-9A-Za-z][0-9A-Za-z.-]*)?)")
 
 
-def _command(port, cmd):
-    """Open, flush, write. Fire-and-forget."""
-    with serial.Serial(port, baudrate=BAUDRATE) as ser:
-        ser.flush()
-        ser.write(cmd.encode())
+# ============================================================================
+# Low-level serial
+# ============================================================================
+
+#: Lines the ESP32 ROM and second-stage bootloader print on reset. None of them
+#: is ever a reply to a command, and every one of them will happily parse as
+#: "not a float" if a caller mistakes it for one.
+_BOOT_CHATTER_RE = re.compile(
+    r"^(ESP-ROM:|rst:0x|boot:0x|configsip:|clk_drv:|mode:[A-Z]|load:0x|entry 0x|"
+    r"Saved PC:|SPIWP:|SPI (Speed|Mode|Flash)|csum |ets |invalid header:|"
+    r"waiting for download|[IWED] \()")
+
+#: Retryable negative acknowledgements. A bench instrument answers this when the
+#: command line it received was mangled - which is exactly what a reset in the
+#: middle of a write produces - so it means "ask again", not "unsupported".
+_ERROR_REPLY_PREFIX = "error"
+
+#: Attempts per bench question, and the pause between them (enough for an
+#: ESP32-class board to finish booting if one did slip through).
+QUERY_ATTEMPTS = 3
+QUERY_RETRY_S = 0.4
 
 
-def _ambit_query(port, cmd, decode="unicode_escape", timeout=2.0):
-    """Open, flush, readiness handshake, write, readline. For Ambit reads."""
-    with serial.Serial(port, baudrate=BAUDRATE, timeout=timeout) as ser:
-        ser.flush()
-        _wait_for_device_ready(ser)
-        ser.write(cmd.encode())
-        return ser.readline().decode(encoding=decode).strip()
+def is_boot_chatter(line):
+    """Is this line bootloader output rather than a reply?"""
+    return bool(_BOOT_CHATTER_RE.match(line.strip()))
 
 
-def _ambit_query_lines(port, cmd, n_lines=2, timeout=2.0, decode="unicode_escape"):
-    """Like _ambit_query, but read a multi-line response.
+def open_serial_no_reset(port, timeout=2.0):
+    """Open a port WITHOUT triggering the device's auto-reset.
 
-    Opens with a read timeout so a missing trailing line degrades to "" instead
-    of blocking forever (e.g. firmware that doesn't print it).
+    Every instrument on this bench except the DC source is an ESP32-class board
+    whose reset (and, on the Ambit's flasher bridge, boot) pin is wired to
+    DTR/RTS, so the usual "open, then assert DTR/RTS" sequence reboots it.
+    Setting DTR/RTS to a steady state *before* opening avoids the reset edge.
 
-    :return: list of n_lines decoded+stripped lines.
-    """
-    with serial.Serial(port, baudrate=BAUDRATE, timeout=timeout) as ser:
-        ser.flush()
-        _wait_for_device_ready(ser)
-        ser.write(cmd.encode())
-        return [ser.readline().decode(encoding=decode).strip()
-                for _ in range(n_lines)]
-
-
-def _open_ambit_serial(port, timeout=1):
-    """Open the Ambit serial port WITHOUT triggering the device's auto-reset.
-
-    The flasher bridge wires DTR/RTS to the ESP32-C3 reset/boot pins, so the
-    usual "open then assert DTR/RTS" sequence reboots the device. That reboot
-    is what switches the actinic LED off right after ``arrun`` latches it on
-    (the ~100 ms "flash"). Setting DTR/RTS to a steady state *before* opening
-    avoids the reset edge, so a latched LED stays lit after the call returns
-    (verified: no boot log on open, close, or reopen).
+    Why this matters beyond speed: a reset at open means the command is written
+    into a booting device, so the reply is boot chatter, or ``error:...`` from a
+    half-swallowed command line, or - worst - a plausible-looking number left
+    over from before the reset. It also drops a latched actinic LED, and it is
+    what lets one port be held open across a whole sweep.
     """
     ser = serial.Serial()
     ser.port = port
@@ -282,278 +406,713 @@ def _open_ambit_serial(port, timeout=1):
     return ser
 
 
-def _ambit_command(port, cmd, settle=0.2, verify_ready=True):
-    """Open, flush, readiness handshake, write, settle delay [, re-verify]. For Ambit writes."""
+#: Kept as the name the Ambit paths use; the behaviour is identical.
+open_ambit_serial = open_serial_no_reset
+
+
+def _read_reply(ser, decode, timeout, validate):
+    """First plausible line, or ``(None, last_line_seen)`` if none arrived.
+
+    Blank lines and boot chatter are skipped without consuming an attempt: they
+    are not answers to anything. A line that *is* an answer but fails
+    ``validate`` ends the attempt, because the question is worth re-asking.
+    """
+    deadline = time.time() + timeout
+    last = ""
+    while time.time() < deadline:
+        raw = ser.readline()
+        if not raw:
+            break                      # read timeout: nothing more is coming
+        line = raw.decode(encoding=decode, errors="replace").strip()
+        if not line or is_boot_chatter(line):
+            continue                   # not an answer to anything
+        last = line
+        if line.lower().startswith(_ERROR_REPLY_PREFIX):
+            return None, line
+        if validate is None or validate(line):
+            return line, line
+        return None, line
+    return None, last
+
+
+def _query(port, cmd, decode="utf-8", timeout=2.0, validate=None,
+           attempts=QUERY_ATTEMPTS):
+    """Ask a bench instrument one question and return the first plausible reply.
+
+    Opened without the DTR/RTS reset edge (see :func:`open_serial_no_reset`), and
+    the port is held open across the retries so a device that *did* reset only
+    pays for it once. Anything already in the input buffer predates the question
+    and is dropped.
+
+    ``validate`` is the caller's notion of a well-formed reply - pass one
+    whenever the reply has a shape, because the failure this guards against is a
+    stale or truncated line that parses cleanly into the wrong number.
+
+    :return: the reply, or the last line seen (possibly ``""``) if no attempt
+        produced a plausible one - so callers keep reporting what they *did* hear
+    """
+    last = ""
+    with open_serial_no_reset(port, timeout=timeout) as ser:
+        for attempt in range(max(1, attempts)):
+            ser.reset_input_buffer()
+            ser.reset_output_buffer()
+            ser.write(cmd.encode())
+            ser.flush()
+            reply, last = _read_reply(ser, decode, timeout, validate)
+            if reply is not None:
+                if attempt:
+                    logger.debug("%s answered %r on attempt %d", port, reply,
+                                 attempt + 1)
+                return reply
+            logger.debug("%s: no plausible reply to %r (attempt %d/%d, saw %r)",
+                         port, cmd.strip(), attempt + 1, attempts, last)
+            time.sleep(QUERY_RETRY_S)
+    return last
+
+
+def _command(port, cmd):
+    """Open, flush, write. Fire-and-forget.
+
+    Left on pyserial's default DTR/RTS assert on purpose: the only user is the
+    Kiprim DC source, which is not an ESP32-class board and has no reset line on
+    those pins - and some USB-serial bridges hold their output until DTR is
+    asserted, so the no-reset open would be a regression there rather than a fix.
+    """
     with serial.Serial(port, baudrate=BAUDRATE) as ser:
         ser.flush()
-        _wait_for_device_ready(ser)
         ser.write(cmd.encode())
-        if settle > 0:
-            time.sleep(settle)
-        if verify_ready:
-            _wait_for_device_ready(ser)
 
 
-def set_voltage(port, voltage):
-    """Set voltage on DC source via serial port."""
-    _command(port, DCSourceProto.SET_VOLTAGE.format(v=voltage))
+def _wait_for_ready(ser, expected=AmbitProto.HELLO_ACK, max_retries=10):
+    """Poll ``hello`` until the device acknowledges. Returns the last reply."""
+    resp = b""
+    for _ in range(max_retries):
+        ser.write(AmbitProto.HELLO.encode())
+        resp = ser.readline()
+        if expected in resp:
+            return resp
+        time.sleep(0.1)
+    return resp
 
+
+# ============================================================================
+# Ambit link: one open port, text and binary on the same UART
+# ============================================================================
+
+#: The device's command-token reader uses a 200 ms inter-character timeout
+#: (``Serial_Input_Chars(choose, ":,", 200, ...)`` in ambit/src/ambit-1.ino). Waiting
+#: longer than that before sending the next verb guarantees the reader has closed
+#: the previous token, whatever USB packetisation did to the line. ``set_actinic``
+#: has always slept 0.3 s here, and that is exactly why its own padding never cost
+#: anything - ``arrun`` returned the instant it saw "Data sent" and did not.
+CONSOLE_TOKEN_SETTLE_S = 0.25
+
+
+class AmbitLink:
+    """A held-open, non-resetting connection to one Ambit.
+
+    Holding the port for a whole sweep matters for more than speed: every
+    open-with-reset costs a boot cycle, and the sweep interleaves binary reads
+    with text writes, which must land on the same session to be attributable to
+    the same device state.
+
+    Usage::
+
+        with AmbitLink(port) as link:
+            cal = link.spec_cal()
+            reading = link.spec_raw()
+    """
+
+    def __init__(self, port, timeout=2.0):
+        self.port = port
+        self.timeout = timeout
+        self._ser = None
+
+    def __enter__(self):
+        self._ser = open_ambit_serial(self.port, timeout=self.timeout)
+        self._ser.reset_input_buffer()
+        _wait_for_ready(self._ser)
+        return self
+
+    def __exit__(self, *exc):
+        if self._ser is not None:
+            self._ser.close()
+            self._ser = None
+        return False
+
+    # ---- text -------------------------------------------------------------
+    def text(self, cmd, n_lines=1, timeout=None, expect=None):
+        """Send a text command and read ``n_lines`` replies.
+
+        ``expect`` is a substring the answer must contain, and it exists because
+        ``reset_input_buffer`` cannot drop what has not arrived yet. The console
+        emits stale lines *after* the flush for two firmware reasons, both
+        expected rather than faulty:
+
+        * ``Serial_Input_Long`` gives each numeric field a **10 ms** timeout
+          (ambit/src/serial.cpp). An ``arrun1`` / ``arrun2`` line that arrives in
+          more than one USB packet leaves its tail unconsumed, and the tail is then
+          read as a *command*: a numeric token dispatches through ``atoi`` into a
+          switch with no such case, so the device answers ``BAD COMMAND``.
+        * ``arrun1`` prints ``Done`` unconditionally, and its ``T:`` plot lines
+          keep coming until the trace ends.
+
+        Reading exactly one line therefore attributes the previous command's
+        leftovers to this one. With ``expect``, non-matching lines are discarded
+        until the deadline, so ``set_currents`` is judged on the device's own
+        ``Currents set to ...`` and not on the residue of the trace before it.
+
+        :return: the matching line (or the last line seen, if none matched)
+        """
+        ser = self._require()
+        old = ser.timeout
+        if timeout is not None:
+            ser.timeout = timeout
+        try:
+            ser.reset_input_buffer()
+            ser.write(cmd.encode())
+            if expect is None:
+                lines = [ser.readline().decode("unicode_escape", errors="replace").strip()
+                         for _ in range(n_lines)]
+                return lines[0] if n_lines == 1 else lines
+
+            deadline = time.time() + (timeout if timeout is not None else old or 2.0)
+            last, discarded = "", []
+            while time.time() < deadline:
+                raw = ser.readline()
+                if not raw:
+                    break
+                line = raw.decode("unicode_escape", errors="replace").strip()
+                if not line:
+                    continue
+                if expect in line:
+                    if discarded:
+                        logger.debug("discarded %d stale console line(s) before "
+                                     "%r echo: %s", len(discarded),
+                                     cmd.strip().split(",")[0], discarded)
+                    return line
+                last = line
+                discarded.append(line)
+            return last
+        finally:
+            ser.timeout = old
+
+    # ---- binary -----------------------------------------------------------
+    def binary(self, frame, resp_size, timeout=5.0):
+        """Send a binary frame and return the payload between 0xA1 and 0xF0.
+
+        Scans for the 0xA1 start byte rather than assuming it is first: the
+        console may have queued text, and the device's own log lines are ASCII
+        (< 0x80) so they can never be mistaken for the marker.
+        """
+        ser = self._require()
+        old = ser.timeout
+        ser.timeout = timeout
+        try:
+            ser.reset_input_buffer()
+            ser.write(frame)
+            ser.flush()
+
+            deadline = time.time() + timeout
+            preamble = bytearray()
+            while time.time() < deadline:
+                byte = ser.read(1)
+                if not byte:
+                    continue
+                if byte[0] == spec_cal.RESP_START:
+                    break
+                preamble += byte
+            else:
+                raise TimeoutError(
+                    f"no 0xA1 response marker within {timeout}s "
+                    f"(saw {bytes(preamble[-80:])!r})")
+
+            payload = ser.read(resp_size)
+            if len(payload) != resp_size:
+                raise IOError(f"short binary payload: {len(payload)} of {resp_size} bytes")
+            end = ser.read(1)
+            if not end or end[0] != spec_cal.RESP_END:
+                raise IOError(f"missing 0xF0 terminator, got {end!r}")
+            return bytes(payload)
+        finally:
+            ser.timeout = old
+
+    def _require(self):
+        if self._ser is None:
+            raise RuntimeError("AmbitLink used outside its with-block")
+        return self._ser
+
+    # ---- the two commands this script needs -------------------------------
+    def spec_raw(self, timeout=5.0):
+        """One cmd-35 reading.
+
+        Timeout is generous by default: the measurement is two AS7341
+        integrations at ATIME 99 / ASTEP 499, i.e. ~278 ms of the ~284 ms total
+        (plan section 12), and the SMUX cannot present all 10 channels in one.
+        """
+        payload = self.binary(spec_cal.build_frame(spec_cal.CMD_SPEC_RAW),
+                              spec_cal.SPEC_RAW_SIZE, timeout=timeout)
+        return spec_cal.decode_spec_raw(payload)
+
+    def spec_cal(self, timeout=3.0, allow_text_fallback=True):
+        """The five calibration vectors, via cmd 33/4 with a text fallback.
+
+        Binary first because it is exact; the ``get_spec_cal`` text mirror exists
+        so a write can be confirmed without speaking binary (plan section 6.4)
+        and is used only if the binary subtype is missing.
+        """
+        frame = spec_cal.build_frame(spec_cal.CMD_INFO, spec_cal.INFO_SUB_SPEC_CAL)
+        try:
+            payload = self.binary(frame, spec_cal.SPEC_CAL_SIZE, timeout=timeout)
+            return spec_cal.decode_spec_cal(payload)
+        except (TimeoutError, IOError, ValueError) as exc:
+            if not allow_text_fallback:
+                raise
+            logger.warning("cmd 33/4 unavailable (%s) - falling back to get_spec_cal text", exc)
+            # Five labelled lines: spec_offset, spec_sens, par_weight,
+            # par_slope, par_intercept. A few extra are read so a stray log
+            # line cannot truncate the set; the parser keys on labels.
+            return spec_cal.parse_spec_cal_text(
+                self.text(AmbitProto.GET_SPEC_CAL, n_lines=8, timeout=timeout))
+
+    # ---- ADPD photodiode trace ------------------------------------------
+    def set_actinic(self, setting, timeout=4.0):
+        """Latch the actinic LED on at ``setting`` and leave it lit.
+
+        On the link rather than its own connection so a sweep point can latch the
+        LED, read the references and record an ADPD trace without ever closing
+        the port - closing and reopening with DTR/RTS asserted would reset the
+        device and drop the latch. Firmware forces the LED off for settings <= 3
+        (``if (actinic > 3)`` in ``run_arr_type1``, ambit/src/PAM.cpp).
+
+        Read to completion rather than fired and forgotten, because this command
+        can fail silently in two different ways and both leave the LED dark:
+
+        * ``LED_RUN`` is ``arrun1``, whose every numeric field is parsed with
+          ``Serial_Input_Long(",", 10)`` - a **10 ms** per-field timeout
+          (ambit/src/serial.cpp). A field that does not arrive in time reads back
+          ``atol("") == 0``. If ``len`` reads 0 the run never happens at all; if
+          ``persist`` reads 0 the run ends with ``AS_LED_OFF()``
+          (ambit/src/PAM.cpp). Nothing is reported in either case.
+        * ``arrun1`` prints ``Done`` unconditionally, so ``Done`` alone proves
+          only that the command was dispatched.
+
+        What does discriminate is the per-point ``T:...`` line: ``arrun1`` sets
+        ``CONNECTION_TYPE = PLOTTING`` and one such line is emitted per sampled
+        point, so seeing at least one proves ``len`` parsed as >= 1 and the trace
+        really ran. ``persist`` still cannot be confirmed from the device side -
+        only the reference MiniPAR can see whether the LED stayed lit, which is
+        why :func:`run_calibratron._led_reference_sweep` verifies it there.
+
+        :return: True if the device emitted at least one sampled point
+        """
+        ser = self._require()
+        old_timeout = ser.timeout
+        ser.timeout = 0.5
+        ran = False
+        try:
+            ser.reset_input_buffer()
+            ser.write(AmbitProto.LED_RUN.format(led=int(setting)).encode())
+            ser.flush()
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                raw = ser.readline()
+                if not raw:
+                    continue
+                line = raw.decode("utf-8", errors="replace").strip()
+                if line.startswith("T:"):
+                    ran = True
+                elif line == "Done":
+                    break
+        finally:
+            ser.timeout = old_timeout
+        if not ran:
+            logger.warning("set_actinic(%s): no sampled point reported; the "
+                           "arrun1 field parse may have timed out", setting)
+        time.sleep(0.3)
+        ser.reset_input_buffer()
+        return ran
+
+    def zero_pulse_currents(self):
+        """Zero the ADPD pulse LEDs (620 / 720 / IR).
+
+        Without this the detector sees its own pulse LEDs and ``sun`` / ``leaf``
+        stop being a measurement of the incident light, which is the whole point
+        of recording them during a sweep. Re-asserted before every trace rather
+        than once per session: it is one write, and if anything did reset the
+        device mid-sweep the currents would silently come back non-zero and every
+        later photodiode reading would be contaminated with no sign of it.
+
+        :return: True if the device echoed the expected confirmation
+        """
+        echo = self.text(AmbitProto.SET_CURRENTS.format(i620=0, i720=0, ir=0),
+                         timeout=2.0, expect=AmbitProto.CURRENTS_ACK)
+        if AmbitProto.CURRENTS_ACK not in echo:
+            # Not "unsupported": the verb exists in every firmware this bench
+            # flashes (ambit/src/do_command.h, case hash("set_currents")). A
+            # BAD COMMAND here is the console answering an earlier stray token,
+            # so say what was actually heard and that the LEDs stayed live.
+            logger.warning("set_currents not acknowledged (last console line: %r); "
+                           "ADPD pulse LEDs may still be driving", echo)
+            return False
+        return True
+
+    def arrun(self, actinic=0, num_points=5, freq=10, timeout=15.0):
+        """Record an ADPD trace and return the parsed per-channel buffers.
+
+        The device answers with one ``Data:<tag>,Length:N<TAB><v>,<v>,...`` line
+        per channel buffer, then ``Data sent``.
+
+        :param actinic: actinic setting driven during the run (0 = off)
+        :return: ``{"actinic", "num_points", "freq_hz", "pulse_currents_zeroed",
+            "data": {tag: [ints]}}``, or None if nothing arrived
+        """
+        zeroed = self.zero_pulse_currents()
+
+        nh, nl = divmod(int(num_points), 256)
+        fh, fl = divmod(int(freq), 256)
+        ser = self._require()
+        old_timeout = ser.timeout
+        ser.timeout = 2.0
+        data, got_end = {}, False
+        try:
+            ser.reset_input_buffer()
+            ser.write(AmbitProto.ARRUN2.format(nh=nh, nl=nl, fh=fh, fl=fl,
+                                               act=int(actinic)).encode())
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                raw = ser.readline()
+                if not raw:
+                    continue
+                line = raw.decode("utf-8", errors="replace").strip()
+                if line.startswith("Data:"):
+                    head, _, values = line.partition(chr(9))
+                    tag = head[len("Data:"):].split(",", 1)[0]
+                    try:
+                        data[tag] = [int(v) for v in values.split(",") if v.strip()]
+                    except ValueError:
+                        data[tag] = values        # keep an unparseable payload
+                elif "Data sent" in line:
+                    got_end = True
+                    break
+        finally:
+            ser.timeout = old_timeout
+
+        if not got_end:
+            logger.warning("arrun: 'Data sent' not received within %ss (tags: %s)",
+                           timeout, sorted(data))
+        # Let the console's token reader time out before anyone writes again, and
+        # drop whatever the trace left behind. Without this the *next* command
+        # lands inside the reader's 200 ms window and can be swallowed whole -
+        # which is how six of seven set_currents calls disappeared and the ADPD
+        # pulse LEDs stayed live through every trace of a sweep.
+        self._settle_console()
+
+        if not data:
+            return None
+        return {"actinic": int(actinic), "num_points": int(num_points),
+                "freq_hz": int(freq), "pulse_currents_zeroed": zeroed,
+                "truncated": not got_end, "data": data}
+
+    def _settle_console(self, delay=CONSOLE_TOKEN_SETTLE_S):
+        """Wait out the device's command-token timeout, then drop stale input."""
+        time.sleep(delay)
+        self._require().reset_input_buffer()
+
+    # ---- tier-3 setters ---------------------------------------------------
+    def set_par_slope(self, value):
+        """Write ``par_slope``. Returns the value actually put on the wire."""
+        return self._set_tier3(AmbitProto.SET_PAR_SLOPE, value, "par_slope",
+                               spec_cal.valid_par_slope)
+
+    def set_par_intercept(self, value):
+        """Write ``par_intercept``. Returns the value actually put on the wire."""
+        return self._set_tier3(AmbitProto.SET_PAR_ICEPT, value, "par_intercept",
+                               spec_cal.valid_par_intercept)
+
+    def _set_tier3(self, template, value, label, predicate):
+        # Round first, then validate what will actually be transmitted: the wire
+        # format is fixed-point, so a value that passes the predicate at full
+        # precision can fail it after rounding (e.g. a slope of 4e-7 -> 0.000000,
+        # which the firmware rejects as outside (0, 100]).
+        wire = round(float(value), 6)
+        if not predicate(wire):
+            raise ValueError(f"{label} {wire!r} fails the firmware predicate; refusing to send")
+        reply = self.text(template.format(value=wire), n_lines=2, timeout=3.0)
+        confirmed = any(AmbitProto.SAVE_CONFIRMED in line for line in reply)
+        if not confirmed:
+            # One positive test covers "rejected", "save failed: ESP_ERR_..."
+            # and any future wording, because only the confirmation passes.
+            raise RuntimeError(f"device did not confirm {label}={wire}: {reply!r}")
+        time.sleep(0.2)          # let the NVS commit settle
+        return wire
+
+
+def get_spec_raw(port, timeout=5.0):
+    """One-shot cmd-35 read on its own connection."""
+    with AmbitLink(port) as link:
+        return link.spec_raw(timeout=timeout)
+
+
+def get_spec_cal(port, timeout=3.0):
+    """One-shot calibration read-back on its own connection."""
+    with AmbitLink(port) as link:
+        return link.spec_cal(timeout=timeout)
+
+
+def probe_cmd35(port):
+    """Is this firmware's cmd 35 the 80-byte three-tier form?
+
+    Probes the opcode rather than gating on a version number. Version gating is
+    broken by construction here: ``tools/version.py`` keeps the leading X.Y.Z of
+    ``git describe``, so every dev build reports the tag it descends from - a
+    build of the rewrite branch still says 1.1.4 (plan section 9).
+
+    :return: ``(ok, detail)``
+    """
+    try:
+        with AmbitLink(port) as link:
+            reading = link.spec_raw()
+    except ValueError as exc:                # wrong length or unknown format
+        return False, str(exc)
+    except (TimeoutError, IOError) as exc:
+        return False, f"cmd 35 did not answer: {exc}"
+    return True, (f"cmd 35 format {reading.format}, {spec_cal.SPEC_RAW_SIZE} B, "
+                  f"tint {reading.tint_ms:.0f} ms, gains "
+                  f"{spec_cal.gain_multiplier(reading.gain_low):g}x/"
+                  f"{spec_cal.gain_multiplier(reading.gain_high):g}x")
+
+
+def write_tier3_with_readback(port, *, par_slope, par_intercept, previous):
+    """Write both tier-3 parameters, verify by read-back, roll back on mismatch.
+
+    Read-back cannot go through the reboot dump: the five vectors live outside
+    ``ambit_calibration_info_t`` on purpose (plan decision 2), so nothing about
+    them appears in the boot banner. It has to be cmd 33/4 (or its text mirror).
+
+    Both parameters are written before either is verified. They are two separate
+    NVS commits, so a failure between them leaves ``a`` new and ``b`` old - a
+    bounded, self-consistent state, unlike a torn blob, and one this function
+    then rolls back.
+
+    :param previous: ``(par_slope, par_intercept)`` read before the write, needed
+        because the device carries no record of its own prior value
+    :return: the verified :class:`spec_cal.SpecCal`
+    :raises RuntimeError: if verification fails; the rollback outcome is included
+    """
+    prev_slope, prev_intercept = float(previous[0]), float(previous[1])
+
+    with AmbitLink(port) as link:
+        wire_slope = link.set_par_slope(par_slope)
+        wire_intercept = link.set_par_intercept(par_intercept)
+        observed = link.spec_cal()
+
+        ok = (abs(observed.par_slope - wire_slope) <= 1e-4 * max(1.0, abs(wire_slope))
+              and abs(observed.par_intercept - wire_intercept) <= 1e-4 * max(1.0, abs(wire_intercept)))
+        if ok:
+            logger.info("tier 3 verified: par_slope %.6g -> %.6g, par_intercept %.6g -> %.6g",
+                        prev_slope, observed.par_slope, prev_intercept, observed.par_intercept)
+            return observed
+
+        restore_error = None
+        try:
+            link.set_par_slope(prev_slope)
+            link.set_par_intercept(prev_intercept)
+            restored = link.spec_cal()
+            if (abs(restored.par_slope - prev_slope) > 1e-4 * max(1.0, abs(prev_slope))
+                    or abs(restored.par_intercept - prev_intercept) > 1e-4 * max(1.0, abs(prev_intercept))):
+                restore_error = (f"restore read back ({restored.par_slope:.6g}, "
+                                 f"{restored.par_intercept:.6g})")
+        except Exception as exc:              # keep the original failure context
+            restore_error = str(exc)
+
+    detail = (f"; previous tier 3 restoration failed: {restore_error}" if restore_error
+              else "; previous tier 3 restored")
+    raise RuntimeError(
+        f"tier-3 write was not verified (read ({observed.par_slope:.6g}, "
+        f"{observed.par_intercept:.6g}), expected ({wire_slope:.6g}, "
+        f"{wire_intercept:.6g})){detail}")
+
+
+# ============================================================================
+# Bench references
+# ============================================================================
 
 def set_current(port, current):
-    """Set current on DC source via serial port."""
+    """Set the DC source output current, in amps."""
     _command(port, DCSourceProto.SET_CURRENT.format(i=current))
 
 
-# ============================================================================
-# PAR Reading Functions
-# ============================================================================
+def set_voltage(port, voltage):
+    """Set the DC source output voltage, in volts."""
+    _command(port, DCSourceProto.SET_VOLTAGE.format(v=voltage))
 
-def get_par_MP(port, raw=False):
-    """
-    Read PAR value from MiniPAR device.
 
-    :param port: Serial port of the MiniPAR device
-    :param raw: If True, request raw PAR value; if False, request calibrated value
-    :return: PAR value as float
+class ReferenceUnavailable(RuntimeError):
+    """The PAR reference stopped answering. A sweep point without a reference is
+    not a calibration point, so this aborts the sweep rather than degrading it."""
+
+
+def _looks_like_float(line):
+    try:
+        float(line)
+    except ValueError:
+        return False
+    return True
+
+
+def get_par_MP(port):
+    """The MiniPAR's calibrated PAR, in umol m-2 s-1.
+
+    :raises ReferenceUnavailable: if no attempt produced a number
     """
-    cmd = MiniParProto.GET_PAR_RAW if raw else MiniParProto.GET_PAR_CAL
-    return float(_query(port, cmd))
+    resp = _query(port, MiniParProto.GET_PAR_CAL, validate=_looks_like_float)
+    try:
+        return float(resp)
+    except ValueError:
+        raise ReferenceUnavailable(
+            f"MiniPAR on {port} did not return a PAR value in "
+            f"{QUERY_ATTEMPTS} attempts (last reply: {resp!r})") from None
+
+
+def get_par_raw_MP(port):
+    """The MiniPAR's PAR before its own slope/intercept, or None."""
+    resp = _query(port, MiniParProto.GET_PAR_RAW, validate=_looks_like_float)
+    try:
+        return float(resp)
+    except ValueError:
+        logger.warning("MiniPAR raw PAR unavailable (reply: %r)", resp)
+        return None
 
 
 def get_spec_raw_MP(port):
-    """
-    Read the raw (unscaled) spectrometer channel counts from a MiniPAR device.
+    """The MiniPAR's raw channel counts.
 
-    Sends 'spec_raw'; the MiniPAR answers '<model>,<c0>,...,<c9>' with the
-    channels in order F1_415..F8_680, CLEAR, NIR.
-
-    :param port: Serial port of the MiniPAR device
-    :return: {"model": str, "counts": [int, ...]}, or None if the firmware
-        doesn't support the command / the reply doesn't parse.
+    Order is F1..F8, **CLEAR, NIR** - the last two are the opposite way round
+    from ambit. :func:`minipar_to_ambit_order` does the swap; plan section 8
+    explains why getting it wrong fails quietly rather than loudly.
     """
-    resp = _query(port, MiniParProto.GET_SPEC_RAW)
+    resp = _query(port, MiniParProto.GET_SPEC_RAW,
+                  validate=lambda line: "," in line)
     try:
         model, *counts = resp.split(",")
         if model.startswith("error") or not counts:
             raise ValueError(resp)
         return {"model": model, "counts": [int(c) for c in counts]}
     except ValueError:
-        print(f"[spec_raw] MiniPAR raw spectrum unavailable (reply: {resp!r})")
+        logger.warning("MiniPAR raw spectrum unavailable (reply: %r)", resp)
         return None
 
 
-def get_par_AMB(port, raw=False, return_spec=False):
-    """
-    Read PAR value from Ambit device.
+def minipar_to_ambit_order(values):
+    """Reorder a miniPar-ordered 10-vector into ambit's order (swap the last two).
 
-    The firmware answers 'get_par'/'PAR' with two lines: the PAR value, then
-    the 10 spectrometer channel values (F1_415..F8_680, NIR, CLEAR) as CSV.
-    Both lines are always read so the serial buffer stays clean; the channel
-    values are pre-scaled by the firmware Spec_COE factors and wrap at uint16.
-
-    :param port: Serial port of the Ambit device
-    :param raw: If True, request raw PAR value; if False, request calibrated value
-    :param return_spec: If True, also return the spectrometer channel values
-    :return: PAR value as float, or (par, channels) if return_spec=True where
-        channels is a list of 10 ints (None if the channel line didn't parse)
+    NIR and Clear carry the most dissimilar coefficients in every vector
+    (``spec_sens`` 5.78 vs 31.57, ``par_weight`` -37.7 vs +16.9), so a missed
+    swap produces a confidently wrong number rather than an obvious one.
     """
-    cmd = AmbitProto.GET_PAR_RAW if raw else AmbitProto.GET_PAR_CAL
-    par_line, spec_line = _ambit_query_lines(port, cmd, n_lines=2)
-    par = float(par_line)
-    if not return_spec:
-        return par
+    if not values or len(values) != spec_cal.N_CHANNELS:
+        return None
+    by_name = dict(zip(spec_cal.MINIPAR_CHANNELS, values))
+    return [by_name[name] for name in spec_cal.CHANNELS]
+
+
+def get_spec_status_MP(port):
+    """The MiniPAR's live acquisition settings, or None."""
+    resp = _query(port, MiniParProto.SPEC_STATUS,
+                  validate=lambda line: "model=" in line)
+    kv = dict(tok.split("=", 1) for tok in resp.split(",") if "=" in tok)
+    if "model" not in kv:
+        logger.warning("MiniPAR status unavailable (reply: %r)", resp)
+        return None
+    out = {"model": kv["model"]}
+    for key in ("available", "atime", "astep", "gain"):
+        try:
+            out[key] = int(kv[key])
+        except (KeyError, ValueError):
+            out[key] = None
+    return out
+
+
+def get_spec_coeff_MP(port):
+    """The MiniPAR's per-channel PAR coefficients, read off the device."""
+    # A vector cut short by a reset mid-print still parses as floats, so the
+    # channel count is the part worth checking: the reply carries one coefficient
+    # per AS7341 channel (the first N_CHANNELS of which are the ones used).
+    resp = _query(port, MiniParProto.GET_SPEC_COEF,
+                  validate=lambda line: (
+                      len(line.split(",")) >= spec_cal.N_CHANNELS
+                      and all(_looks_like_float(v) for v in line.split(","))))
     try:
-        spec = [int(v) for v in spec_line.split(",")]
+        return [float(v) for v in resp.split(",")]
     except ValueError:
-        print(f"[get_par] Ambit channel line didn't parse (reply: {spec_line!r})")
-        spec = None
-    return par, spec
-
-
-def record_arrun_AMB(port, actinic=0, num_points=5, freq=10, timeout=15.0):
-    """
-    Record an ADPD array run on the Ambit and return the parsed data arrays.
-
-    Sends 'set_currents,0,0,0' (ADPD pulse LEDs dark, so the detector records
-    only the incident light) followed by an 'arrun2' trace, both over a single
-    port-open session: opening the port resets the device, so a separate open
-    would undo the zeroed currents. Note the run drives the actinic LED per
-    ``actinic`` (firmware forces it OFF when <= 3) and leaves it off afterwards.
-
-    The device replies with one 'Data:<tag>,Length:N\\t<v>,<v>,...' line per
-    channel buffer (env, s_630, r_630, sun, leaf, s_730, r_730) and a final
-    'Data sent'.
-
-    :param port: Serial port of the Ambit device
-    :param actinic: actinic LED setting driven during the run (0 = off)
-    :param num_points: samples to record
-    :param freq: sampling frequency in Hz
-    :param timeout: overall seconds to wait for the data dump
-    :return: {"actinic", "num_points", "freq_hz", "data": {tag: [ints]}},
-        or None if no data arrived.
-    """
-    nh, nl = divmod(int(num_points), 256)
-    fh, fl = divmod(int(freq), 256)
-    data, got_end = {}, False
-    with serial.Serial(port, baudrate=BAUDRATE, timeout=2.0) as ser:
-        ser.flush()
-        _wait_for_device_ready(ser)
-
-        ser.write(AmbitProto.SET_CURRENTS.format(i620=0, i720=0, ir=0).encode())
-        echo = ser.readline()
-        if b"Currents set" not in echo:
-            print(f"[arrun] unexpected set_currents echo: {echo!r}")
-
-        ser.write(AmbitProto.ARRUN2.format(nh=nh, nl=nl, fh=fh, fl=fl,
-                                           act=int(actinic)).encode())
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            raw = ser.readline()
-            if not raw:
-                continue
-            line = raw.decode("utf-8", errors="replace").strip()
-            if line.startswith("Data:"):
-                head, _, values = line.partition("\t")
-                tag = head[len("Data:"):].split(",", 1)[0]
-                try:
-                    data[tag] = [int(v) for v in values.split(",") if v.strip()]
-                except ValueError:
-                    data[tag] = values          # keep unparseable payload as text
-            elif "Data sent" in line:
-                got_end = True
-                break
-
-    if not got_end:
-        print(f"[arrun] 'Data sent' not received within {timeout}s "
-              f"(got tags: {sorted(data)})")
-    if not data:
+        logger.warning("MiniPAR coefficients unavailable (reply: %r)", resp)
         return None
-    return {"actinic": int(actinic), "num_points": int(num_points),
-            "freq_hz": int(freq), "data": data}
+
+
+def get_cal_par_MP(port):
+    """The MiniPAR's own PAR slope / intercept, or None."""
+    resp = _query(port, MiniParProto.GET_CAL_PAR,
+                  validate=lambda line: "slope=" in line and "intercept=" in line)
+    kv = dict(tok.split("=", 1) for tok in resp.split(",") if "=" in tok)
+    try:
+        return {"slope": float(kv["slope"]), "intercept": float(kv["intercept"])}
+    except (KeyError, ValueError):
+        logger.warning("MiniPAR calibration unavailable (reply: %r)", resp)
+        return None
+
+
+def read_minipar_reference(port):
+    """Snapshot the reference MiniPAR's identity and settings.
+
+    This defines the PAR that ambit's tier 3 is anchored to, so it is recorded in
+    full: its settings and its own slope/intercept are what a later Li-250A
+    comparison would need in order to rescale every stored sweep. What accepting
+    a MiniPAR instead of a Li-250A costs is argued in the README ("The MiniPAR as
+    reference instead of a Li-250A") rather than restated in every payload.
+    """
+    return {
+        "name": _query(port, MiniParProto.GET_NAME,
+                       validate=lambda line: "," not in line),
+        "spec_status": get_spec_status_MP(port),
+        "par_coefficients": get_spec_coeff_MP(port),
+        "calibration": get_cal_par_MP(port),
+    }
 
 
 # ============================================================================
-# Calibration Functions
-# ============================================================================
-
-def _wait_for_device_ready(ser, expected_response=AmbitProto.HELLO_ACK, max_retries=10):
-    """
-    Wait for device to be ready by polling with 'hello' command.
-
-    :param ser: Serial port object
-    :param expected_response: Byte string to look for in response
-    :param max_retries: Maximum number of retry attempts
-    :return: The response received from device
-    """
-    resp = b""
-    for _ in range(max_retries):
-        ser.write(AmbitProto.HELLO.encode())
-        resp = ser.readline()
-        if expected_response in resp:
-            return resp
-        time.sleep(0.1)
-    return resp
-
-
-def set_par_gain(port, coeff):
-    """
-    Upload PAR calibration coefficient (slope) to Ambit device.
-
-    :param port: Serial port of the Ambit device
-    :param coeff: Calibration coefficient value
-    """
-    _ambit_command(port, AmbitProto.SET_SPEC.format(coeff=coeff))
-
-
-def set_ambit_led_gain(port, coeff):
-    """
-    Set LED calibration gain on Ambit device.
-
-    :param port: Serial port of the Ambit device
-    :param coeff: Calibration coefficient value
-    """
-    _ambit_command(port, AmbitProto.SET_ACT.format(coeff=coeff))
-
-
-def measure_adpd_baseline(port, timeout=20.0):
-    """Measure, but do not persist, the six-channel ADPD dark baseline."""
-    with serial.Serial(port, baudrate=BAUDRATE, timeout=timeout) as ser:
-        ser.flush()
-        _wait_for_device_ready(ser)
-        ser.write(AmbitProto.MEASURE_BASELINE.encode())
-        for _ in range(12):
-            line = ser.readline().decode("utf-8", errors="replace").strip()
-            parts = line.split(",")
-            if len(parts) != 6:
-                continue
-            try:
-                values = [int(value) for value in parts]
-            except ValueError:
-                continue
-            if all(0 <= value <= 0xFFFFFF for value in values):
-                return values
-    raise RuntimeError("AMBIT did not return a valid six-channel ADPD baseline")
-
-
-def set_adpd_baseline(port, values, timeout=5.0):
-    """Persist one complete baseline vector and require firmware verification."""
-    if len(values) != 6 or any(
-        isinstance(value, bool) or not isinstance(value, int) or value < 0 or value > 0xFFFFFF
-        for value in values
-    ):
-        raise ValueError("ADPD baseline must contain six unsigned 24-bit integers")
-    command = AmbitProto.SET_BASELINE.format(values=",".join(str(value) for value in values))
-    with serial.Serial(port, baudrate=BAUDRATE, timeout=timeout) as ser:
-        ser.flush()
-        _wait_for_device_ready(ser)
-        ser.write(command.encode())
-        response = ser.readline().decode("utf-8", errors="replace").strip()
-    if response != "Baseline saved and verified":
-        raise RuntimeError(f"AMBIT baseline write was not verified: {response!r}")
-
-
-
-
-# ============================================================================
-# Device Information & Management
+# Ambit boot dump
 # ============================================================================
 
 @dataclass
 class AmbitInfo:
-    """Container for Ambit device information parsed from a reboot dump."""
+    """Ambit device information parsed from a reboot dump.
 
-    # Identity / firmware
-    FW: bytes = b""                                    # e.g. b"0.0.4"
+    This is ``ambit_calibration_info_t`` as the console prints it. Note what is
+    NOT here: none of the five spectral/PAR vectors, by design (plan decision 2).
+    ``light_slope`` is the legacy ``spec_coef`` - recorded because cmd 31 and
+    deployed devices still use it, never written by this script.
+    """
+
+    FW: bytes = b""
     IsValid: bool = False
-    name: bytes = b""                                  # calibration "Name", e.g. b"AmbitV004"
-
-    # Firmware metadata
+    name: bytes = b""
     MAC: str = ""
     fw_size: int = 0
     fw_date: str = ""
-
-    # Chip detection
     adpd_chip_version: "int | None" = None
-
-    # Metadata snapshot (GPS + IMU)
-    metadata: dict = field(default_factory=dict)       # lon/lat/alt/time/acc/vacc/info1/x/y/z
-
-    # Main calibration line
-    act_led_coeff: float = 0.0                         # Actinic
-    light_slope: float = 0.0                           # Spec
+    metadata: dict = field(default_factory=dict)
+    act_led_coeff: float = 0.0
+    light_slope: float = 0.0            # legacy spec_coef; read-only here
     emit_coeff: float = 0.0
     sun_coeff: float = 0.0
     temp_offset: float = 0.0
     temp_slope: float = 0.0
-
-    # Actinic LED curve {50: 983, 100: 2032, 150: 3121, 200: 4174, 250: 5233}
     actinic_curve: dict = field(default_factory=dict)
-
-    # ADPD + MLX raw calibration vectors
     adpd_calibration: list = field(default_factory=list)
     mlx_calibration: list = field(default_factory=list)
 
-    def processInfo(self, line):
+    def process_line(self, line):
         try:
             text = line.decode(errors="replace").strip()
         except Exception:
@@ -569,30 +1128,22 @@ class AmbitInfo:
             return
 
         if text.startswith("Metadata:"):
-            self.metadata = {
-                k: _coerce_num(v)
-                for k, v in _kv_pairs(text[len("Metadata:"):]).items()
-            }
+            self.metadata = {k: _coerce_num(v)
+                             for k, v in _kv_pairs(text[len("Metadata:"):]).items()}
             return
 
         if text.startswith("Calibration:"):
             payload = text[len("Calibration:"):].strip()
-
-            # "ADPD: 0\t0\t0\t0\t0\t0"
             if payload.startswith("ADPD"):
                 _, vals = payload.split(":", 1)
                 self.adpd_calibration = [_coerce_num(v) for v in vals.split()]
                 return
-
             kv = _kv_pairs(payload)
-
-            # Act_50, Act_100, ...  -> {50: 983, ...}
             curve = {int(k.split("_")[1]): int(v)
                      for k, v in kv.items() if k.startswith("Act_")}
             if curve:
                 self.actinic_curve.update(curve)
                 return
-
             if "Name" in kv:        self.name = kv["Name"].encode()
             if "Actinic" in kv:     self.act_led_coeff = float(kv["Actinic"])
             if "Spec" in kv:
@@ -605,15 +1156,13 @@ class AmbitInfo:
             return
 
         if text.startswith("MLX:"):
-            self.mlx_calibration = [_coerce_num(v)
-                                    for v in text[len("MLX:"):].split() if v]
+            self.mlx_calibration = [_coerce_num(v) for v in text[len("MLX:"):].split() if v]
             return
 
         if text.startswith("FW:"):
             body = text[len("FW:"):].strip()
             if "MAC:" in body:
-                # Tab-separated; the Date value contains spaces ("Mar  5 2026"),
-                # so split on tabs only rather than on any whitespace.
+                # Tab-separated; the Date value contains spaces ("Mar  5 2026").
                 kv = _kv_pairs(body, sep="\t")
                 self.MAC = kv.get("MAC", "")
                 self.fw_size = int(kv["Size"]) if kv.get("Size", "").isdigit() else 0
@@ -621,25 +1170,26 @@ class AmbitInfo:
             else:
                 self.FW = body.encode()
                 self.IsValid = True
-            return
+
+    @property
+    def firmware(self):
+        return self.FW.decode(errors="replace").strip()
+
+    @property
+    def device_name(self):
+        return self.name.decode(errors="replace").strip()
 
     def to_dict(self):
-        """Return all parsed device info as a plain (JSON-friendly) dict.
-
-        Byte fields (``FW``, ``name``) are decoded to ``str`` and the nested
-        ``metadata`` / ``actinic_curve`` dicts and calibration lists are copied
-        so the result can be mutated without touching this instance.
-        """
         return {
-            "FW": self.FW.decode(errors="replace"),
+            "FW": self.firmware,
             "IsValid": self.IsValid,
-            "name": self.name.decode(errors="replace"),
+            "name": self.device_name,
             "MAC": self.MAC,
             "fw_size": self.fw_size,
             "fw_date": self.fw_date,
             "adpd_chip_version": self.adpd_chip_version,
             "act_led_coeff": self.act_led_coeff,
-            "light_slope": self.light_slope,
+            "light_slope_legacy_spec_coef": self.light_slope,
             "emit_coeff": self.emit_coeff,
             "sun_coeff": self.sun_coeff,
             "temp_offset": self.temp_offset,
@@ -651,27 +1201,16 @@ class AmbitInfo:
         }
 
     def __str__(self):
-        return (
-            f"FW: {self.FW} (MAC={self.MAC}, size={self.fw_size}B, date={self.fw_date})\n"
-            f"Name: {self.name}, valid: {self.IsValid}\n"
-            f"Calibration: Spec(light_slope)={self.light_slope}, "
-            f"Actinic(act_led_coeff)={self.act_led_coeff}, "
-            f"Emit={self.emit_coeff}, Sun={self.sun_coeff}, "
-            f"Temp_offset={self.temp_offset}, Temp_slope={self.temp_slope}\n"
-            f"Actinic curve: {self.actinic_curve}\n"
-            f"ADPD cal: {self.adpd_calibration} (chip v{self.adpd_chip_version})\n"
-            f"MLX cal: {self.mlx_calibration}\n"
-            f"Metadata: {self.metadata}"
-        )
+        return (f"FW: {self.firmware} (MAC={self.MAC}, size={self.fw_size}B, date={self.fw_date})\n"
+                f"Name: {self.device_name}, valid: {self.IsValid}\n"
+                f"Legacy spec_coef (cmd 31 only): {self.light_slope}\n"
+                f"Actinic: {self.act_led_coeff}, Emit: {self.emit_coeff}, Sun: {self.sun_coeff}\n"
+                f"Actinic curve: {self.actinic_curve}\n"
+                f"ADPD cal: {self.adpd_calibration} (chip v{self.adpd_chip_version})")
 
 
 def _kv_pairs(text, sep=None):
-    """Parse 'k:v<sep>k:v ...' into a dict.
-
-    With the default sep=None, splits on any run of whitespace and also treats
-    commas as separators. Pass sep="\\t" to split on tabs only, which preserves
-    values that contain spaces (e.g. a 'Date:Mar  5 2026' field).
-    """
+    """Parse 'k:v<sep>k:v ...'. Default splits on whitespace and commas."""
     out = {}
     tokens = text.split(sep) if sep is not None else text.replace(",", " ").split()
     for tok in tokens:
@@ -684,250 +1223,168 @@ def _kv_pairs(text, sep=None):
 
 def _coerce_num(v):
     try:
-        if "." in v: return float(v)
-        return int(v)
+        return float(v) if "." in v else int(v)
     except (ValueError, TypeError):
         return v
 
 
-
-def ambit_reboot(port):
-    """
-    Reboot Ambit device and retrieve its configuration information.
-
-    :param port: Serial port of the Ambit device
-    :return: AmbitInfo object with device configuration
-    """
+def ambit_reboot(port, max_lines=26):
+    """Reboot the Ambit and parse its boot dump into an :class:`AmbitInfo`."""
     info = AmbitInfo()
 
-    with serial.Serial(port, baudrate=BAUDRATE) as ser:
+    # Opened WITH the DTR/RTS reset edge on purpose: that alone produces a boot
+    # dump on any firmware, even one without the ``reboot`` verb. It also means
+    # the hello below usually lands in a booting device, so a missed ack is the
+    # normal case here and not worth an operator-facing warning.
+    with serial.Serial(port, baudrate=BAUDRATE, timeout=2.0) as ser:
         ser.flush()
-        ser.write(AmbitProto.HELLO.encode())
-        resp = ser.readline()
-        ser.write(AmbitProto.HELLO.encode())
-        resp = ser.readline()
-
-        while AmbitProto.HELLO_ACK not in resp:
-            ser.write(AmbitProto.HELLO.encode())
-            resp = ser.readline()
-
+        resp = _wait_for_ready(ser)
+        if AmbitProto.HELLO_ACK not in resp:
+            logger.debug("Ambit on %s did not acknowledge hello before reboot "
+                         "(expected while it boots from the open)", port)
         ser.write(AmbitProto.REBOOT.encode())
-
-        # Process ambit data
-        for i in range(26):
-            l = ser.readline()
-            info.processInfo(l)
-            logger.debug("ambit boot line: %s", l)
-            if b"FW:" in l and b"MAC" not in l:
+        for _ in range(max_lines):
+            line = ser.readline()
+            info.process_line(line)
+            logger.debug("boot line: %s", line)
+            if b"FW:" in line and b"MAC" not in line:
                 info.IsValid = True
                 break
 
-    # Verify device is back online
-    with serial.Serial(port, baudrate=BAUDRATE) as ser:
+    with serial.Serial(port, baudrate=BAUDRATE, timeout=2.0) as ser:   # back online?
         ser.flush()
-        ser.write(AmbitProto.HELLO.encode())
-        r = ser.readline()
-        ser.write(AmbitProto.HELLO.encode())
-        r = ser.readline()
-
+        _wait_for_ready(ser)
     return info
 
 
+def detect_ambit_version(port):
+    """Firmware version from the ``hello`` reply, falling back to the boot dump."""
+    try:
+        with AmbitLink(port) as link:
+            reply = link.text(AmbitProto.HELLO, timeout=2.0)
+    except Exception as exc:
+        logger.warning("could not read the hello reply on %s: %s", port, exc)
+        reply = ""
+    match = HELLO_FW_RE.search(reply or "")
+    if match:
+        return match.group(1).strip()
+    return ambit_reboot(port).firmware or None
+
+
 def set_ambit_name(port, name):
-    """
-    Set the Ambit device name.
-
-    Sends ``hello`` twice, waits for the device's acknowledgment, then sends
-    ``set_name,<name>``.
-
-    :param port: Serial port of the Ambit device
-    :param name: New device name (string)
-    """
-    with serial.Serial(port, baudrate=BAUDRATE) as ser:
-        ser.flush()
-        ser.write(AmbitProto.HELLO.encode())
-        resp = ser.readline()
-        ser.write(AmbitProto.HELLO.encode())
-        resp = ser.readline()
-
-        while AmbitProto.HELLO_ACK not in resp:
-            ser.write(AmbitProto.HELLO.encode())
-            resp = ser.readline()
-
-        ser.write(AmbitProto.SET_NAME.format(name=name).encode())
+    """Set the Ambit device name."""
+    with AmbitLink(port) as link:
+        link.text(AmbitProto.SET_NAME.format(name=name), timeout=2.0)
         time.sleep(0.2)
 
 
-def set_MP_name(port, name="miniPAR", verbose=False):
-    """
-    Set the device name on a MiniPAR device.
+# ============================================================================
+# Actinic LED and ADPD dark baseline (unrelated to the PAR chain, still live)
+# ============================================================================
 
-    Sends ``set_name,<name>`` and verifies the device echoes the new name back
-    in the ``device_name`` field of its JSON response.
-
-    :param port: Serial port of the MiniPAR device
-    :param name: New device name (default: "miniPAR")
-    :param verbose: If True, log the raw device response
-    :return: True if the device confirmed the new name, False otherwise
-    """
-    resp = _query(port, MiniParProto.SET_NAME.format(name=name))
-    if verbose:
-        logger.info("Response from device: %s", resp)
-    try:
-        returned_name = json.loads(resp).get("device_name", "")
-    except json.JSONDecodeError:
-        logger.warning("Could not parse MiniPAR response: %s", resp)
-        return False
-    if returned_name != name:
-        logger.warning("Error setting name %r: device returned %r", name, returned_name)
-        return False
-    return True
+def set_ambit_led(port, current):
+    """Latch the actinic LED on its own connection. See :meth:`AmbitLink.set_actinic`."""
+    with AmbitLink(port) as link:
+        link.set_actinic(current)
 
 
-def make_calibration_payload(info_precalibration=None, info_postcalibration=None, *,
-                             device_id=None, device_name=None,
-                             firmware_version=None, device_firmware=None,
-                             device_version="1", protocol_id="CALIBRATION",
-                             par_cal=None, led_cal=None, baseline_cal=None,
-                             firmware_release_provenance=None,
-                             indent=2):
-    """Build the JSON calibration-upload payload from the pre/post AmbitInfo dumps.
+def record_arrun(port, actinic=0, num_points=5, freq=10, timeout=15.0):
+    """One ADPD trace on its own connection. See :meth:`AmbitLink.arrun`."""
+    with AmbitLink(port) as link:
+        return link.arrun(actinic=actinic, num_points=num_points, freq=freq,
+                          timeout=timeout)
 
-    The ``device_*`` / ``firmware_version`` fields default to values read from
-    ``info_postcalibration`` (falling back to ``info_precalibration``); pass
-    explicit strings to override any of them.
 
-    :param info_precalibration: AmbitInfo captured before calibration
-    :param info_postcalibration: AmbitInfo captured after calibration
-    :param par_cal: PAR-sensor calibration block (x/y arrays + labels + slope/r2)
-        from calibrate_par_sensor(); ``None`` (-> JSON null) if it was skipped
-    :param led_cal: actinic-LED calibration block, same shape, from
-        calibrate_led(); ``None`` if it was skipped
-    :param baseline_cal: six-channel ADPD dark-baseline measurement, QC, and
-        readback record; ``None`` if it was skipped
-    :param firmware_release_provenance: revalidated immutable GitHub release,
-        manifest, and flash-asset proof selected for this session
-    :param indent: json.dumps indent (None for a compact one-line payload)
-    :return: a JSON string ready to send
-    :raises ValueError: if either AmbitInfo is missing / never populated
-    """
-    empty = [
-        label for label, info in (("info_precalibration", info_precalibration),
-                                  ("info_postcalibration", info_postcalibration))
-        if info is None or not getattr(info, "IsValid", False)
-    ]
-    if empty:
-        logger.warning(
-            "make_calibration_payload aborted: %s %s empty / not populated - "
-            "call ambit_reboot() to fill them before building the payload.",
-            " and ".join(empty), "are" if len(empty) > 1 else "is",
-        )
-        raise ValueError(f"Cannot build calibration payload: {', '.join(empty)} empty / not populated")
+def set_ambit_led_gain(port, coeff):
+    """Persist the actinic LED gain (``act_led_coeff``)."""
+    with AmbitLink(port) as link:
+        reply = link.text(AmbitProto.SET_ACT.format(coeff=float(coeff)), timeout=3.0)
+        if "reject" in reply.lower() or "failed" in reply.lower():
+            raise RuntimeError(f"device did not accept act_led_coeff={coeff}: {reply!r}")
+        time.sleep(0.2)
 
-    def _pick(attr, default=""):
-        for src in (info_postcalibration, info_precalibration):
-            v = getattr(src, attr, None)
-            if v:
-                return v.decode(errors="replace") if isinstance(v, bytes) else str(v)
-        return default
 
-    mac  = device_id        or _pick("MAC")        or "MACID"
-    name = device_name      or _pick("name")       or "NAME"
-    fw   = firmware_version or _pick("FW")          or "1"
+def measure_adpd_baseline(port, timeout=20.0):
+    """Measure, but do not persist, the six-channel ADPD dark baseline."""
+    with serial.Serial(port, baudrate=BAUDRATE, timeout=timeout) as ser:
+        ser.flush()
+        _wait_for_ready(ser)
+        ser.write(AmbitProto.MEASURE_BASELINE.encode())
+        for _ in range(12):
+            parts = ser.readline().decode("utf-8", errors="replace").strip().split(",")
+            if len(parts) != 6:
+                continue
+            try:
+                values = [int(v) for v in parts]
+            except ValueError:
+                continue
+            if all(0 <= v <= 0xFFFFFF for v in values):
+                return values
+    raise RuntimeError("Ambit did not return a valid six-channel ADPD baseline")
 
-    payload = {
-        "sample": [
-            {
-                "protocol_id": protocol_id,
-                "set": [
-                    {
-                        "METADATA_PRECALIBRATION":  info_precalibration.to_dict(),
-                        "METADATA_POSTCALIBRATION": info_postcalibration.to_dict(),
-                        "PAR_SENSOR_CALIBRATION":   par_cal,
-                        "LED_CALIBRATION":          led_cal,
-                        "ADPD_BASELINE_CALIBRATION": baseline_cal,
-                        "FIRMWARE_RELEASE_PROVENANCE": firmware_release_provenance,
-                    }
-                ],
-            }
-        ],
-        "device_firmware": device_firmware or fw,
-        "device_id": mac,
-        "device_name": name,
-        "device_version": device_version,
-        "firmware_version": fw,
-        "timestamp": iso_timestamp(),
-    }
-    return json.dumps(payload, indent=indent)
+
+def set_adpd_baseline(port, values, timeout=5.0):
+    """Persist one complete baseline vector and require firmware verification."""
+    if len(values) != 6 or any(isinstance(v, bool) or not isinstance(v, int)
+                               or v < 0 or v > 0xFFFFFF for v in values):
+        raise ValueError("ADPD baseline must contain six unsigned 24-bit integers")
+    command = AmbitProto.SET_BASELINE.format(values=",".join(str(v) for v in values))
+    with serial.Serial(port, baudrate=BAUDRATE, timeout=timeout) as ser:
+        ser.flush()
+        _wait_for_ready(ser)
+        ser.write(command.encode())
+        response = ser.readline().decode("utf-8", errors="replace").strip()
+    if response != "Baseline saved and verified":
+        raise RuntimeError(f"Ambit baseline write was not verified: {response!r}")
 
 
 # ============================================================================
-# Firmware Flashing (Ambit)
+# Firmware
 # ============================================================================
-# Self-contained Ambit firmware flasher: it resolves esptool, reads the flash
-# layout from the firmware release manifest, finds the flasher serial port and
-# runs the flash - so the calibration tooling can (re)flash an Ambit without
-# shelling out to any external uploader script.
-#
-# The images are no longer vendored in this repo. ``firmware_fetch.py`` pulls
-# the latest public AMBIT release into ``firmware_cache/<version>/`` and the folder
-# it returns is what gets flashed. That folder always carries a ``manifest.json``
-# describing which file goes at which offset, so a layout change on the firmware
-# side (extra partition, renamed image, ...) needs no change here.
 
-# WCH CH343 USB-serial bridge used by the Ambit flasher.
-FLASHER_VID = 0x1A86
-FLASHER_PID = 0x55D4
-FLASHER_VIDPID = "1A86:55D4"
+def esptool_command():
+    """The argv prefix used to invoke esptool, cross-platform.
 
-# Release manifest that describes the flash layout; written by the public AMBIT
-# release pipeline and downloaded alongside the images.
-AMBIT_MANIFEST_NAME = "manifest.json"
-
-# Folder this module lives in. The bundled Windows esptool.exe is looked up
-# here (recursively) - it is part of the repo, not of the firmware download.
-REPO_DIR = os.path.dirname(os.path.abspath(__file__))
-
-# Default cache root used when no firmware folder is passed in; must match the
-# one run_Calibratron.py uses so both share one download.
-from runtime_paths import data_dir
-AMBIT_FIRMWARE_CACHE = str(data_dir() / "firmware_cache")
-
-
-def find_file(start_dir, filename):
-    """Return the path to the first ``filename`` found in ``start_dir`` or any
-    of its sub-folders, or None if it is nowhere to be found.
+    The packaged app re-enters its own executable in ``--esptool`` mode
+    (packaging/launcher.py): ``sys.executable`` is then the app, not a Python
+    interpreter. A source checkout runs the installed package via
+    ``python -m esptool``, or an ``esptool.exe`` placed next to this module on
+    Windows.
     """
-    for root, _dirs, files in os.walk(start_dir):
-        if filename in files:
-            return os.path.join(root, filename)
-    return None
+    if getattr(sys, "frozen", False):
+        return [sys.executable, "--esptool"]
+    if importlib.util.find_spec("esptool") is not None:
+        return [sys.executable, "-m", "esptool"]
+    if os.name == "nt":
+        local_exe = os.path.join(HERE, "esptool.exe")
+        if os.path.isfile(local_exe):
+            return [local_exe]
+    raise RuntimeError("esptool not found - `pip install esptool`, or place "
+                       "esptool.exe in the Calibratron folder (Windows only)")
 
 
-def read_flash_layout(firmware_dir, manifest_name=AMBIT_MANIFEST_NAME):
-    """Read the esptool flash layout out of a firmware folder's manifest.
+def read_flash_layout(firmware_dir, manifest_name="manifest.json"):
+    """Read and *verify* the esptool flash layout from a folder's manifest.
 
-    The manifest's ``flash`` array is the contract with the firmware repo::
+    The manifest's ``flash`` array is the contract with the firmware repo, and
+    every image it lists is verified here against the manifest's own size and
+    sha256 before it is allowed anywhere near esptool. That check is the
+    non-negotiable half of the firmware contract: a truncated bootloader
+    written at 0x0 leaves the device dead until recovered, and a wrong
+    partition table scrambles how NVS is read. Where the folder *came from* -
+    a proven GitHub release or a local build - is provenance, recorded in the
+    calibration record but deliberately not gated here.
 
-        {"flash": [{"file": "bootloader.bin", "offset": "0x0", "sha256": ...},
-                   ...]}
-
-    :param firmware_dir: folder holding ``manifest.json`` and the images
-    :param manifest_name: manifest file name (override only for tests)
-    :return: list of (offset, filename) tuples, ascending by offset
-    :raises FileNotFoundError: if the manifest or one of its images is missing
-    :raises RuntimeError: if the manifest is not usable JSON / has no layout
+    :return: ``[(offset, filename), ...]`` ascending by offset
     """
-    firmware_dir = Path(firmware_dir)
-    manifest_path = firmware_dir / manifest_name
+    manifest_path = os.path.join(firmware_dir, manifest_name)
     try:
         with open(manifest_path, encoding="utf-8") as f:
             manifest = json.load(f)
     except FileNotFoundError as exc:
         raise FileNotFoundError(
-            f"no {manifest_name} in {firmware_dir} - the firmware folder must be "
-            f"one produced by firmware_fetch.fetch_latest()"
-        ) from exc
+            f"no {manifest_name} in {firmware_dir} - the folder must be one "
+            f"produced by firmware_fetch.fetch_latest()") from exc
     except json.JSONDecodeError as exc:
         raise RuntimeError(f"{manifest_path} is not valid JSON: {exc}") from exc
 
@@ -941,13 +1398,25 @@ def read_flash_layout(firmware_dir, manifest_name=AMBIT_MANIFEST_NAME):
         offset = entry.get("offset") if isinstance(entry, dict) else None
         if not name or offset is None:
             raise RuntimeError(f"{manifest_path}: 'flash' entry missing file/offset: {entry!r}")
-        image = firmware_dir / str(name)
-        if not image.is_file():
-            raise FileNotFoundError(f"{manifest_path} lists {name!r} but {image} is missing")
+        path = os.path.join(firmware_dir, str(name))
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f"{manifest_path} lists {name!r} but it is missing")
+        want_size, want_sha = entry.get("size"), entry.get("sha256")
+        if not want_size or not want_sha:
+            raise RuntimeError(f"{manifest_path}: {name!r} carries no size/sha256 - "
+                               f"the image cannot be verified before flashing")
+        if os.path.getsize(path) != want_size:
+            raise RuntimeError(f"{name}: size {os.path.getsize(path)} B disagrees "
+                               f"with the manifest's {want_size} B")
+        digest = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                digest.update(chunk)
+        if digest.hexdigest() != str(want_sha).lower():
+            raise RuntimeError(f"{name}: sha256 disagrees with the manifest - "
+                               f"the image is corrupt or was swapped")
         layout.append((str(offset), str(name)))
 
-    # esptool does not care about the order, but a deterministic ascending
-    # layout makes the logged command readable and diffable across runs.
     def _offset_value(item):
         try:
             return int(item[0], 0)
@@ -958,407 +1427,148 @@ def read_flash_layout(firmware_dir, manifest_name=AMBIT_MANIFEST_NAME):
     return layout
 
 
-def esptool_command():
-    """Return the argv prefix used to invoke esptool, cross-platform.
+def flash_ambit_firmware(firmware_dir, port, chip="esp32c3"):
+    """Flash the verified images in ``firmware_dir`` with esptool.
 
-    Prefers the ``esptool.exe`` bundled in this repo on Windows (searched from
-    this module's folder downwards - the firmware cache folder holds only the
-    downloaded images, never the flasher); otherwise runs the installed
-    ``esptool`` package via ``python -m esptool``.
+    Self-contained rather than delegating to the repo-root ``helpers``: that
+    module is a different module of the same name, so importing it from here
+    resolves back to this one. Release *selection* policy still lives in
+    ``firmware_fetch``; only the esptool invocation is duplicated.
 
-    :raises RuntimeError: if no esptool is available
+    ``port`` is the port the Ambit answered discovery on. On this bench the
+    Ambit talks through its flasher bridge (whose DTR/RTS drive reset/boot, see
+    :func:`open_serial_no_reset`), so a discovered Ambit is a flashable one -
+    no separate scan for a bridge with a particular USB VID:PID, which broke
+    every time the fixture shipped with a different WCH chip.
+
+    Integrity, not provenance, is what gates the flash: every image is checked
+    against the manifest's size and sha256 by :func:`read_flash_layout`, so a
+    corrupt or half-copied folder can never reach esptool. Whether the folder
+    is a *proven GitHub release* (``firmware_fetch.is_complete``) is a
+    traceability property of the calibration record - the caller decides what
+    provenance to record, and a local development build is a legitimate
+    source. The host-side gates (the firmware math check, ``seed_match``, the
+    closed-loop confirmation) independently verify the firmware's behaviour
+    during calibration either way.
+
+    esptool runs with ``cwd=firmware_dir`` and bare file names, which keeps the
+    command line free of the spaces that Windows bench paths are full of.
+
+    :return: True once the device has been flashed
+    :raises RuntimeError: if any image fails the manifest's size/sha256, or if
+        esptool exits non-zero
     """
-    if getattr(sys, "frozen", False):
-        return [sys.executable, "--esptool"]
-    if os.name == "nt":
-        local_exe = find_file(REPO_DIR, "esptool.exe")
-        if local_exe:
-            return [local_exe]
-    if importlib.util.find_spec("esptool") is not None:
-        return [sys.executable, "-m", "esptool"]
-    raise RuntimeError(
-        "esptool not found - install it with `pip install esptool`, "
-        "or place esptool.exe in the Calibratron folder (Windows only)."
-    )
-
-
-def flasher_ports():
-    """List serial ports that look like an Ambit flasher (WCH CH343 bridge).
-
-    :return: list of port device names matching the flasher VID/PID
-    """
-    found = []
-    for port in sorted(serial.tools.list_ports.comports()):
-        try:
-            device = getattr(port, "device", None)
-            if not device:
-                continue
-            hwid = (getattr(port, "hwid", "") or "").upper()
-            vidpid_ok = ((getattr(port, "vid", None), getattr(port, "pid", None))
-                         == (FLASHER_VID, FLASHER_PID))
-            if vidpid_ok or FLASHER_VIDPID in hwid:
-                found.append(device)
-        except Exception:
-            continue
-    return found
-
-
-def detect_invalid_header(port, timeout_s=5, baud=BAUDRATE):
-    """Listen briefly on ``port`` for the boot-time "invalid header" string.
-
-    :param port: serial port to probe
-    :param timeout_s: how long to listen, in seconds
-    :return: (found, serial_output) - ``found`` is True if "invalid header" was seen
-    """
-    serial_output = ""
-    logger.info("Listening on %s for %ss to detect boot status...", port, timeout_s)
-    try:
-        with serial.Serial(port, baud, timeout=0.1) as ser:
-            deadline = time.time() + timeout_s
-            while time.time() < deadline:
-                chunk = ser.read(128)
-                if not chunk:
-                    continue
-                serial_output += chunk.decode(errors="replace")
-                if "invalid header" in serial_output:
-                    return True, serial_output
-    except serial.SerialException as exc:
-        logger.error("Could not open serial port %s: %s", port, exc)
-    return False, serial_output
-
-
-def flash_ambit(port, firmware_dir):
-    """Write the Ambit firmware images in ``firmware_dir`` to the device on
-    ``port`` by invoking esptool.
-
-    The offsets and file names come from the folder's ``manifest.json`` (see
-    :func:`read_flash_layout`). esptool is invoked with ``cwd=firmware_dir`` and
-    bare file names, which keeps the command line short and free of the spaces
-    that Windows bench paths are full of.
-
-    :param port: serial port of the Ambit flasher
-    :param firmware_dir: folder holding manifest.json + the firmware images
-    :raises FileNotFoundError: if the manifest or one of its images is missing
-    :raises RuntimeError: if esptool exits non-zero
-    """
-    # This is the lowest-level public flash entry point. Verify here so direct
-    # callers cannot bypass public/immutable provenance and byte checks.
-    import firmware_fetch
-    if not firmware_fetch.is_complete(firmware_dir):
-        raise RuntimeError(
-            f"Firmware folder {firmware_dir} is not a complete verified "
-            f"AMBIT release cache entry"
-        )
     layout = read_flash_layout(firmware_dir)
+    logger.info("flashing via %s", port)
 
-    cmd = [
-        *esptool_command(),
-        "--chip", "esp32c3",
-        "--baud", "921600",
-        "--port", port,
-        "--before", "default_reset",
-        "--after", "hard_reset",
-        "write_flash", "-z",
-        "--flash_mode", "keep",
-        "--flash_freq", "keep",
-        "--flash_size", "keep",
-    ]
+    # The snake_case esptool options are the deprecated spelling in esptool v5,
+    # but v5 still accepts them, so one command line works with both the bundled
+    # v4 esptool.exe and a pip-installed v5.
+    cmd = [*esptool_command(), "--chip", chip, "--baud", "921600", "--port", port,
+           "--before", "default_reset", "--after", "hard_reset",
+           "write_flash", "-z", "--flash_mode", "keep",
+           "--flash_freq", "keep", "--flash_size", "keep"]
     for offset, image in layout:
         cmd += [offset, image]
 
-    logger.info("Flashing %s with esptool (%s)...", port,
-                ", ".join(f"{off}:{img}" for off, img in layout))
+    logger.info("esptool layout: %s", ", ".join(f"{o}:{i}" for o, i in layout))
     result = subprocess.run(cmd, cwd=str(firmware_dir))
     if result.returncode != 0:
         raise RuntimeError(f"esptool exited with return code {result.returncode}")
-    logger.info("Flash completed.")
-
-
-def flash_ambit_firmware(firmware_dir=None, *, cache_root=None, port=None,
-                         force_flash=True):
-    """Get the Ambit firmware, find the flasher port, and flash the device.
-
-    :param firmware_dir: folder holding manifest.json + the firmware images
-        (normally the ``firmware_cache/<version>/`` folder returned by
-        ``firmware_fetch.fetch_latest``); if None, the latest public AMBIT release
-        is fetched into ``cache_root`` first
-    :param cache_root: firmware cache folder used when ``firmware_dir`` is None
-        (default: ``<repo>/firmware_cache``)
-    :param port: flasher serial port; if None, auto-detected (exactly one
-        flasher must be connected)
-    :param force_flash: when True, always flash; when False, flash only if a
-        boot-time "invalid header" is detected on the device
-    :return: True if the device was flashed, False if flashing was skipped
-    :raises FileNotFoundError: if the manifest / images cannot be found
-    :raises RuntimeError: if the firmware cannot be fetched, if zero / multiple
-        flasher ports are found, or if esptool fails
-    """
-    if firmware_dir is None:
-        # Imported lazily: only the flashing path needs it, and it must stay
-        # usable even when this module is imported from a notebook kernel that
-        # never flashes anything.
-        import firmware_fetch
-        _version, firmware_dir = firmware_fetch.fetch_latest(cache_root or AMBIT_FIRMWARE_CACHE)
-    logger.info("Using firmware folder: %s", firmware_dir)
-
-    if port is None:
-        ports = flasher_ports()
-        if not ports:
-            raise RuntimeError("No Ambit flasher USB device found.")
-        if len(ports) != 1:
-            raise RuntimeError(
-                f"Expected 1 flasher port, found {len(ports)}: {', '.join(ports)}"
-            )
-        port = ports[0]
-    logger.info("Using flasher port: %s", port)
-
-    if not force_flash:
-        needs_flash, serial_log = detect_invalid_header(port)
-        if not needs_flash:
-            if serial_log.strip():
-                logger.info("No 'invalid header' detected; flashing not required.")
-            else:
-                logger.warning("No serial output during probe; skipping flash.")
-            return False
-
-    flash_ambit(port, firmware_dir)
+    logger.info("flash completed")
     return True
 
 
 # ============================================================================
-# Post-flash hardware self-test (Ambit)
+# The calibration record
 # ============================================================================
-# Ported verbatim (logic and regexes) from the retired
-# ``firmware_ambit/uploader.py``, which was the only place it lived. Nothing in
-# the calibration flow calls it today; it is kept importable because it is the
-# only automated check of the Ambit's sensor stack right after a flash, and it
-# would otherwise be lost with the uploader script.
 
-# MLX90632 temperature-sensor acceptance limits.
-MIN_TEMP = -10             # deg C, lower bound for a valid reading
-MAX_TEMP = 40              # deg C, upper bound for a valid reading
-MLX_READ_TIME_LIMIT = 100  # ms, max acceptable sensor read time
+#: Boot-dump fields dropped from the record. The GPS/IMU block is placeholder
+#: data on the bench (no fix indoors) and IsValid is a parsing artefact.
+DROPPED_FIELDS = ("metadata", "IsValid")
 
 
-def ambit_readlines(ser, timeout=1.0, invalid_bahave=False, max_lines=1, ending_line=""):
-    """Read up to ``max_lines`` newline-terminated lines from ``ser``.
+def _device_dict(info):
+    return {k: v for k, v in info.to_dict().items() if k not in DROPPED_FIELDS}
 
-    Byte-at-a-time on purpose: the ``check`` dump is tab-formatted and the
-    caller's regexes match on those exact tabs, and a byte >= 128 means the
-    device is spewing framing noise rather than text (``invalid_bahave=True``
-    aborts on that instead of poisoning the parse).
 
-    :param ser: an open serial.Serial
-    :param timeout: overall budget in seconds
-    :param invalid_bahave: stop at the first non-ASCII byte
-    :param max_lines: stop after this many lines
-    :param ending_line: stop early once a line contains this substring
-    :return: list of decoded lines (newline included)
+def make_calibration_payload(info_before, info_after, *,
+                             spec_par_cal=None, led_cal=None, baseline_cal=None,
+                             station=None, protocol_id="CALIBRATION",
+                             device_id=None, device_name=None, indent=None):
+    """Build the openJII calibration payload.
+
+    ``sample`` is a JSON *string*, not a nested array: openJII's ``sensor_schema``
+    declares it ``StringType`` and ``from_json`` yields null on a type mismatch,
+    which silently drops the whole calibration on ingest. The topic, client id
+    and ingestion timestamps are added by the AWS IoT rule, so none are sent.
+
+    :raises ValueError: if either dump is missing or never populated
     """
-    lines = []
-    line = ""
-    t0 = time.perf_counter()
-    while (time.perf_counter() - t0) < timeout:
-        if ser.in_waiting > 0:
-            r = ser.read()
-            if r < bytes([128]):
-                line += r.decode(errors="replace")
-            else:
-                if invalid_bahave:
-                    break
-            if r == b"\n":
-                lines.append(line)
-                line = ""
-                if ending_line and ending_line in lines[-1]:
-                    break
-        else:
-            time.sleep(0.1)
-        if len(lines) >= max_lines:
-            break
-    return lines
+    empty = [label for label, info in (("info_before", info_before),
+                                       ("info_after", info_after))
+             if info is None or not getattr(info, "IsValid", False)]
+    if empty:
+        raise ValueError(f"cannot build the calibration payload: {', '.join(empty)} "
+                         f"empty / not populated - call ambit_reboot() first")
+
+    device = _device_dict(info_after)
+    before = _device_dict(info_before)
+    changed = {k: v for k, v in before.items() if device.get(k) != v}
+
+    sample = [{
+        "protocol_id": protocol_id,
+        "set": [{
+            "device": device,
+            "device_before": changed or None,
+            "spec_par_calibration": spec_par_cal,
+            "led_calibration": led_cal,
+            "adpd_baseline_calibration": baseline_cal,
+            "station": station,
+        }],
+    }]
+
+    payload = {
+        "sample": json.dumps(sample, separators=(",", ":")),
+        "device_id": device_id or device.get("MAC") or "MACID",
+        "device_name": device_name or device.get("name") or "NAME",
+        "device_version": "1",
+        "device_firmware": device.get("FW") or "1",
+        "timestamp": iso_timestamp(),
+    }
+    return json.dumps(payload, indent=indent)
 
 
-def is_increasing(values):
-    """True when each value in a sweep is larger than the one before it.
+def save_payload(payload, mac=None, directory=None):
+    """Write the payload to ``<directory>/<YYYY-MM-DD_HH-MM-SS>_<MAC>.json``.
 
-    The gain / current sweeps step the photodiode amplification up, so a
-    healthy channel returns readings that climb monotonically.
+    Stored indented and with ``sample`` expanded so a saved calibration stays
+    readable; what goes on the wire stays the compact openJII form.
     """
-    return len(values) > 1 and all(b > a for a, b in zip(values, values[1:]))
+    directory = directory or os.path.join(DATA_DIR, "calibrations")
+    data = json.loads(payload) if isinstance(payload, str) else payload
+    mac = mac or data.get("device_id") or "UNKNOWN"
 
+    readable = dict(data)
+    if isinstance(readable.get("sample"), str):
+        try:
+            readable["sample"] = json.loads(readable["sample"])
+        except ValueError:
+            pass
 
-def ambit_self_test(port):
-    """Run the Ambit's built-in ``check`` self-test and grade every sensor.
+    os.makedirs(directory, exist_ok=True)
+    path = os.path.join(directory, f"{datetime.now():%Y-%m-%d_%H-%M-%S}_{mac}.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(readable, f, indent=2)
+    logger.info("wrote %s", path)
+    return path
 
-    Detects the device with ``hello``, then drives ``check`` and parses the
-    dump: ADPD chip id, AS7341 light level, MLX90632 timing + plausibility
-    (cross-checked against the ESP32 die temperature), and the four photodiode
-    gain / current sweeps.
-
-    :param port: serial port of the Ambit device
-    :return: dict of check name -> pass/fail bool
-    """
-
-    ret_dict = {"FW": False, "ADPD": False, "AS7341": False, "MLX90632": False,
-                "Temp": False, "LightPass-SunPD": False, "LightPass-LeafPD": False,
-                "LightPass-SignalPD": False, "LightPass-RefPD": False}
-
-    ambit_ready = 0
-    with serial.Serial(port, BAUDRATE) as ser:
-        trials = 50
-        logger.info("Trying to detect Ambit %d times", trials)
-        ser.write(b"\r\n")
-        ser.flush()
-        time.sleep(0.1)
-
-        for attempt in range(trials):
-            # Drop any stale/buffered output (e.g. the boot log) before each
-            # attempt, so we read the fresh reply to *this* hello instead of
-            # chewing through a backlog one line at a time over all 50 trials.
-            ser.reset_input_buffer()
-            ser.write(b"hello\r\n")
-            lines = ambit_readlines(ser, timeout=0.5, invalid_bahave=True, max_lines=1)
-            logger.info("Reading: %s; %d/%d waiting for 'NEW Name Here Ready'...",
-                        lines, attempt + 1, trials)
-            if len(lines) == 0:
-                continue
-
-            if "NEW Name Here Ready" in lines[0]:
-                logger.info("[PASS]\t\tAmbit is detected")
-                ret_dict["FW"] = True
-                ambit_ready = 1
-                break
-
-            if ambit_ready == 0:
-                logger.info("Received: %s", lines[0].strip())
-
-        if ambit_ready == 0:
-            logger.info("[FAILED]\tAmbit detection failed")
-            return ret_dict
-
-        ser.write(b"check\r\n")
-        lines = ambit_readlines(ser, timeout=5, invalid_bahave=False, max_lines=50,
-                               ending_line="Done!!")
-
-        adpd_match = re.compile(r"Checking ADPD\s+ADPD Found, chip version: (\d+)")
-        as7341_match = re.compile(r"Checking AS7341\s+Success\s+(\d+),(\d+),(\d+),(\d+),(\d+),(\d+),(\d+),(\d+)")
-        mlx_match = re.compile(r"Checking MLX90632\s+Success\s+(\d+)\s+([\d.]+)\s+([\d.]+)")
-        chip_match = re.compile(r"ESP32Temp\s+([\d.]+)")
-        sunPD_match = re.compile(r"Sun PD\t\t(\d+)\t(\d+)\t(\d+)\t(\d+)\t(\d+)\n")
-        leafPD_match = re.compile(r"Leaf PD\t\t(\d+)\t(\d+)\t(\d+)\t(\d+)\t(\d+)\n")
-        signal_match = re.compile(r"Signal\t\t(\d+)\t(\d+)\t(\d+)\t(\d+)\t(\d+)\n")
-        ref_match = re.compile(r"Ref\t\t(\d+)\t(\d+)\t(\d+)\t(\d+)\t(\d+)\n")
-
-        light_intensity = 0
-        chip_temp = -100.0
-        temp1, temp2 = 100.0, 200.0
-
-        for line in lines:
-            if adpd_match.match(line):
-                ret_dict["ADPD"] = True
-                continue
-
-            if chip_match.match(line):
-                ret = chip_match.findall(line)
-                if ret[0][0].isnumeric():
-                    chip_temp = float(ret[0])
-                continue
-
-            if as7341_match.match(line):
-                ret = as7341_match.findall(line)
-                for n in ret[0]:
-                    if n.isnumeric():
-                        light_intensity += int(n)
-                if light_intensity > 5:
-                    ret_dict["AS7341"] = True
-                    logger.info("[PASS]\t\tAS7341 Found, light intensity: %s", light_intensity)
-                else:
-                    logger.info("[FAILED]\tAS7341 Found, but light intensity too low: %s",
-                                light_intensity)
-                continue
-
-            if mlx_match.match(line):
-                ret = mlx_match.findall(line)
-                read_time = int(ret[0][0])
-                temp1 = float(ret[0][1])
-                temp2 = float(ret[0][2])
-                if read_time < MLX_READ_TIME_LIMIT and temp1 > MIN_TEMP and temp1 < MAX_TEMP and temp2 > MIN_TEMP and temp2 < MAX_TEMP:
-                    ret_dict["MLX90632"] = True
-                    logger.info("[PASS]\t\tMLX90632 Found, reading time:%s, die temp: %s, object temp: %s",
-                                read_time, temp1, temp2)
-                else:
-                    if read_time >= MLX_READ_TIME_LIMIT:
-                        logger.info("[FAILED]\tMLX90632 read time too long: %s", read_time)
-                    else:
-                        logger.info("[FAILED]\tMLX90632 Found, reading time:%s, die temp: %s, object temp: %s",
-                                    ret[0][0], ret[0][1], ret[0][2])
-                continue
-
-            if sunPD_match.match(line):
-                arr = [int(n) for n in sunPD_match.findall(line)[0]]
-                logger.info("Sun PD values: %s", arr)
-                if is_increasing(arr):
-                    logger.info("[PASS]\t\t<SUN> PD gain sweep")
-                    ret_dict["LightPass-SunPD"] = True
-                else:
-                    logger.info("[FAILED]\t<SUN> PD gain sweep not increasing!")
-                continue
-
-            if leafPD_match.match(line):
-                arr = [int(n) for n in leafPD_match.findall(line)[0]]
-                logger.info("Leaf PD values: %s", arr)
-                if is_increasing(arr):
-                    logger.info("[PASS]\t\t<Leaf> PD gain sweep")
-                    ret_dict["LightPass-LeafPD"] = True
-                else:
-                    logger.info("[FAILED]\t<Leaf> PD gain sweep not increasing!")
-                continue
-
-            if signal_match.match(line):
-                arr = [int(n) for n in signal_match.findall(line)[0]]
-                logger.info("Signal PD values: %s", arr)
-                if is_increasing(arr):
-                    logger.info("[PASS]\t\t<Signal> PD Current sweep")
-                    ret_dict["LightPass-SignalPD"] = True
-                else:
-                    logger.info("[FAILED]\t<Signal> PD Current sweep not increasing!")
-                continue
-
-            if ref_match.match(line):
-                arr = [int(n) for n in ref_match.findall(line)[0]]
-                logger.info("Ref PD values: %s", arr)
-                if is_increasing(arr):
-                    logger.info("[PASS]\t\t<Ref> PD Current sweep")
-                    ret_dict["LightPass-RefPD"] = True
-                else:
-                    logger.info("[FAILED]\t<Ref> PD Current sweep not increasing!")
-                continue
-
-    if abs(chip_temp * 2 - temp1 - temp2) > 30:
-        if ret_dict["MLX90632"]:
-            logger.info("[FAILED]\tTemperature reading mismatch, chip temp: %s, mlx temp: %s, %s",
-                        chip_temp, temp1, temp2)
-    else:
-        ret_dict["Temp"] = True
-
-    return ret_dict
-
-
-# ============================================================================
-# MQTT publishing
-# ============================================================================
-# The same code is also available as the standalone `mqtt_publish` module
-# (importable + runnable as a CLI). It's kept here too so `helpers.*` works
-# on its own; `mqtt_publish` is preferred if it's importable.
 
 def _resolve_cert_files(certs_dir):
-    """Locate the AWS-IoT-style credential files inside ``certs_dir`` (searched recursively).
+    """Locate the AWS-IoT credential files under ``certs_dir`` (recursive).
 
     Ignores macOS ``__MACOSX/`` directories and ``._*`` resource forks, so a
     folder straight out of a downloaded ``*_certs.zip`` works as-is.
-
-    :return: (ca_file, cert_file, key_file)
-    :raises FileNotFoundError: if any of the three cannot be found
     """
     try:
         from mqtt_publish import resolve_cert_files
@@ -1376,27 +1586,13 @@ def _resolve_cert_files(certs_dir):
 
     cert_file = _find("*-certificate.pem.crt", "*certificate*.pem*", "*.pem.crt", "*.crt")
     key_file  = _find("*-private.pem.key", "*private*.pem*", "*.pem.key", "*.key")
-    ca_file   = _find("AmazonRootCA1.pem", "AmazonRootCA*.pem", "*RootCA*.pem", "*-CA*.pem", "*.pem")
+    ca_file   = _find("AmazonRootCA1.pem", "AmazonRootCA*.pem", "*RootCA*.pem", "*.pem")
     return ca_file, cert_file, key_file
 
 
 def publish_payload_mqtt5(payload, topic, certs_dir, endpoint, *,
                           client_id=None, port=8883, qos=1, timeout=10.0):
-    """Publish ``payload`` to ``topic`` over MQTT 5 with mutual-TLS auth (e.g. AWS IoT Core).
-
-    :param payload: bytes / str sent verbatim; anything else (dict, list, ...) is json-encoded
-    :param topic: MQTT topic to publish to
-    :param certs_dir: folder holding the cert / key / CA files (see :func:`_resolve_cert_files`)
-    :param endpoint: broker host; a ``scheme://host[:port][/path]`` URL is accepted too
-    :param client_id: MQTT client id (default: the cert folder's basename)
-    :param port: TLS port (default 8883; an explicit ``:port`` in ``endpoint`` wins)
-    :param qos: publish QoS, 0 or 1
-    :param timeout: seconds to wait for the connection and for the publish ack
-    :return: True on success
-    :raises ImportError: if paho-mqtt is not installed
-    :raises ConnectionError / TimeoutError: on connect/publish failure
-    """
-    # Prefer the standalone module if it's importable; fall back to a local copy.
+    """Publish over MQTT 5 with mutual-TLS auth (AWS IoT Core)."""
     try:
         from mqtt_publish import publish_mqtt5
         return publish_mqtt5(payload, topic, certs_dir, endpoint,
@@ -1405,18 +1601,57 @@ def publish_payload_mqtt5(payload, topic, certs_dir, endpoint, *,
         pass
 
     import ssl
-    import threading
     try:
         import paho.mqtt.client as mqtt
         from paho.mqtt.enums import CallbackAPIVersion
-    except ImportError as exc:  # pragma: no cover
-        raise ImportError("publish_payload_mqtt5 needs paho-mqtt >= 2.0: pip install paho-mqtt") from exc
+    except ImportError as exc:
+        raise ImportError("publish_payload_mqtt5 needs paho-mqtt >= 2.0") from exc
 
     ca_file, cert_file, key_file = _resolve_cert_files(certs_dir)
     if client_id is None:
         client_id = os.path.basename(os.path.normpath(certs_dir)) or "calibratron"
+    endpoint, port = _split_endpoint(endpoint, port)
 
-    # Accept a bare host, or a "scheme://host[:port][/path]" URL - reduce to the host.
+    client = mqtt.Client(callback_api_version=CallbackAPIVersion.VERSION2,
+                         client_id=client_id, protocol=mqtt.MQTTv5)
+    client.tls_set(ca_certs=ca_file, certfile=cert_file, keyfile=key_file,
+                   tls_version=ssl.PROTOCOL_TLS_CLIENT)
+    return _mqtt5_deliver(client, payload, topic, endpoint, port, client_id,
+                          qos=qos, timeout=timeout)
+
+
+def publish_payload_mqtt5_wss(payload, topic, endpoint, credentials, *,
+                              client_id="calibratron", port=443, qos=1,
+                              timeout=10.0):
+    """Publish over MQTT 5 on a SigV4-signed WebSocket (AWS IoT Core).
+
+    The bench's route to openJII: ``credentials`` are the short-lived AWS
+    credentials :meth:`openjii_auth.OpenJIIClient.iot_credentials` hands the
+    signed-in operator, so no X.509 material is ever kept on the bench PC.
+    ``client_id`` still travels to the ingest rule as ``clientid()``.
+    """
+    try:
+        import paho.mqtt.client as mqtt
+        from paho.mqtt.enums import CallbackAPIVersion
+    except ImportError as exc:
+        raise ImportError("publish_payload_mqtt5_wss needs paho-mqtt >= 2.0") from exc
+
+    from openjii_auth import presign_iot_wss_path
+
+    endpoint, port = _split_endpoint(endpoint, port)
+    client = mqtt.Client(callback_api_version=CallbackAPIVersion.VERSION2,
+                         client_id=client_id, protocol=mqtt.MQTTv5,
+                         transport="websockets")
+    # Signed per connection: the path carries the whole SigV4 authorisation,
+    # and a stale one is a 403 on the upgrade rather than a retryable error.
+    client.ws_set_options(path=presign_iot_wss_path(endpoint, credentials))
+    client.tls_set()
+    return _mqtt5_deliver(client, payload, topic, endpoint, port, client_id,
+                          qos=qos, timeout=timeout)
+
+
+def _split_endpoint(endpoint, port):
+    """``mqtts://host:8883/x`` -> ``("host", 8883)``; bare hosts keep ``port``."""
     endpoint = endpoint.strip()
     if "://" in endpoint:
         endpoint = endpoint.split("://", 1)[1]
@@ -1425,21 +1660,22 @@ def publish_payload_mqtt5(payload, topic, certs_dir, endpoint, *,
         host, _, maybe_port = endpoint.rpartition(":")
         if maybe_port.isdigit():
             endpoint, port = host, int(maybe_port)
+    return endpoint, port
+
+
+def _mqtt5_deliver(client, payload, topic, endpoint, port, client_id, *,
+                   qos=1, timeout=10.0):
+    """Connect an already-configured client, publish once, disconnect."""
+    import threading
 
     body = payload if isinstance(payload, (bytes, bytearray, str)) else json.dumps(payload)
-
-    connected = threading.Event()
-    conn_state = {}
+    connected, conn_state = threading.Event(), {}
 
     def _on_connect(client, userdata, flags, reason_code, properties=None):
         conn_state["rc"] = reason_code
         connected.set()
 
-    client = mqtt.Client(callback_api_version=CallbackAPIVersion.VERSION2,
-                         client_id=client_id, protocol=mqtt.MQTTv5)
     client.on_connect = _on_connect
-    client.tls_set(ca_certs=ca_file, certfile=cert_file, keyfile=key_file,
-                   tls_version=ssl.PROTOCOL_TLS_CLIENT)
 
     logger.info("MQTT5 connecting to %s:%d as %s ...", endpoint, port, client_id)
     client.connect(endpoint, port, keepalive=60)
@@ -1458,83 +1694,6 @@ def publish_payload_mqtt5(payload, topic, certs_dir, endpoint, *,
         client.loop_stop()
         client.disconnect()
 
-    n = len(body if isinstance(body, (bytes, bytearray)) else body.encode())
-    logger.info("MQTT5 published %d bytes to topic %r", n, topic)
+    logger.info("MQTT5 published %d bytes to %r",
+                len(body if isinstance(body, (bytes, bytearray)) else body.encode()), topic)
     return True
-
-
-# ============================================================================
-# LED Control
-# ============================================================================
-
-def set_ambit_led(port, ledCurrent):
-    """
-    Turn the actinic LED on at the given current and leave it on.
-
-    ``arrun`` latches the LED on; the device keeps it lit until it is reset or
-    told otherwise. The port is opened without resetting the device (see
-    :func:`_open_ambit_serial`), so the LED stays on after this call returns
-    instead of being switched off by a reboot. Call with ``ledCurrent=0`` to
-    switch the LED off.
-
-    :param port: Serial port of the Ambit device
-    :param ledCurrent: LED current value (integer); 0 turns the LED off
-    """
-    with _open_ambit_serial(port) as ser:
-        ser.reset_input_buffer()
-        _wait_for_device_ready(ser)
-        ser.write(AmbitProto.LED_RUN.format(led=ledCurrent).encode())
-        time.sleep(0.2)
-
-
-# ============================================================================
-# Data Analysis & Visualization
-# ============================================================================
-
-def r_squared(y_true, y_pred):
-    """
-    Calculate R² (coefficient of determination) for model fit quality.
-
-    :param y_true: True values (array-like)
-    :param y_pred: Predicted values (array-like)
-    :return: R² value between 0 and 1
-    """
-    ss_res = np.sum((y_true - y_pred) ** 2)
-    ss_tot = np.sum((y_true - np.mean(y_true)) ** 2)
-    if ss_tot == 0:
-        return 1.0 if ss_res == 0 else 0.0
-    return 1 - ss_res / ss_tot
-
-
-def plot_data_and_fit(x, y, coeffs, r2, output=None, xlabel="x", ylabel="y"):
-    """
-    Plot data points and linear fit with statistics.
-
-    :param x: X values (array-like)
-    :param y: Y values (array-like)
-    :param coeffs: Polynomial coefficients from np.polyfit [slope, intercept]
-    :param r2: R² value to display
-    :param output: Optional file path to save the plot
-    :param xlabel: Label for x-axis
-    :param ylabel: Label for y-axis
-    """
-    plt.figure(figsize=(8, 5))
-    plt.scatter(x, y, color="blue", label="Data points")
-
-    x_sort = np.linspace(np.min(x), np.max(x), 300)
-    y_fit = np.polyval(coeffs, x_sort)
-    plt.plot(x_sort, y_fit, color="red",
-             label=f"lin fit: {coeffs[0]:.4g}x + {coeffs[1]:.4g}   R² = {r2:.8g}")
-
-    plt.xlabel(xlabel)
-    plt.ylabel(ylabel)
-    plt.title("Data and Linear Fit")
-    plt.grid(True)
-    plt.legend()
-    plt.tight_layout()
-
-    if output:
-        plt.savefig(output)
-        print(f"Saved plot to {output}")
-
-    plt.show()
