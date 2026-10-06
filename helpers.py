@@ -27,10 +27,12 @@ from __future__ import annotations
 
 import glob
 import hashlib
+import importlib.util
 import json
 import logging
 import os
 import re
+import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
@@ -39,16 +41,8 @@ from datetime import datetime, timezone
 import serial
 import serial.tools.list_ports
 
+import runtime_paths
 import spec_cal
-
-# firmware_fetch lives at the repo root and is already release-policy tested, so
-# it is imported rather than duplicated. APPENDED, never prepended: the repo root
-# holds a *different* module also called `helpers`, and prepending would let it
-# shadow this one on any later fresh import.
-_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if _REPO_ROOT not in sys.path:
-    sys.path.append(_REPO_ROOT)
-
 
 class _UnicodeSafeHandler(logging.StreamHandler):
     """StreamHandler that falls back to ASCII+backslashreplace when the stream's
@@ -77,6 +71,9 @@ if not logger.handlers:
 
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+#: Writable storage: this folder from a source checkout, the per-user data
+#: directory from the packaged app (see runtime_paths.data_dir).
+DATA_DIR = str(runtime_paths.data_dir())
 BAUDRATE = 115200
 
 
@@ -92,7 +89,7 @@ def iso_timestamp():
 _PORTS_CACHE = None
 _PORT_INFO_CACHE = None
 
-PORT_ROLE_CACHE_FILE = os.path.join(HERE, ".port_roles.json")
+PORT_ROLE_CACHE_FILE = os.path.join(DATA_DIR, ".port_roles.json")
 
 
 def invalidate_port_cache():
@@ -1235,11 +1232,16 @@ def ambit_reboot(port, max_lines=26):
     """Reboot the Ambit and parse its boot dump into an :class:`AmbitInfo`."""
     info = AmbitInfo()
 
+    # Opened WITH the DTR/RTS reset edge on purpose: that alone produces a boot
+    # dump on any firmware, even one without the ``reboot`` verb. It also means
+    # the hello below usually lands in a booting device, so a missed ack is the
+    # normal case here and not worth an operator-facing warning.
     with serial.Serial(port, baudrate=BAUDRATE, timeout=2.0) as ser:
         ser.flush()
         resp = _wait_for_ready(ser)
         if AmbitProto.HELLO_ACK not in resp:
-            logger.warning("Ambit on %s never acknowledged hello before reboot", port)
+            logger.debug("Ambit on %s did not acknowledge hello before reboot "
+                         "(expected while it boots from the open)", port)
         ser.write(AmbitProto.REBOOT.encode())
         for _ in range(max_lines):
             line = ser.readline()
@@ -1343,17 +1345,20 @@ def set_adpd_baseline(port, values, timeout=5.0):
 def esptool_command():
     """The argv prefix used to invoke esptool, cross-platform.
 
-    Prefers an ``esptool.exe`` bundled in the repo on Windows; otherwise runs the
-    installed package via ``python -m esptool``.
+    The packaged app re-enters its own executable in ``--esptool`` mode
+    (packaging/launcher.py): ``sys.executable`` is then the app, not a Python
+    interpreter. A source checkout runs the installed package via
+    ``python -m esptool``, or an ``esptool.exe`` placed next to this module on
+    Windows.
     """
-    import importlib.util
-
-    if os.name == "nt":
-        for candidate in glob.glob(os.path.join(_REPO_ROOT, "**", "esptool.exe"),
-                                   recursive=True):
-            return [candidate]
+    if getattr(sys, "frozen", False):
+        return [sys.executable, "--esptool"]
     if importlib.util.find_spec("esptool") is not None:
         return [sys.executable, "-m", "esptool"]
+    if os.name == "nt":
+        local_exe = os.path.join(HERE, "esptool.exe")
+        if os.path.isfile(local_exe):
+            return [local_exe]
     raise RuntimeError("esptool not found - `pip install esptool`, or place "
                        "esptool.exe in the Calibratron folder (Windows only)")
 
@@ -1453,8 +1458,6 @@ def flash_ambit_firmware(firmware_dir, port, chip="esp32c3"):
     :raises RuntimeError: if any image fails the manifest's size/sha256, or if
         esptool exits non-zero
     """
-    import subprocess
-
     layout = read_flash_layout(firmware_dir)
     logger.info("flashing via %s", port)
 
@@ -1542,7 +1545,7 @@ def save_payload(payload, mac=None, directory=None):
     Stored indented and with ``sample`` expanded so a saved calibration stays
     readable; what goes on the wire stays the compact openJII form.
     """
-    directory = directory or os.path.join(HERE, "calibrations")
+    directory = directory or os.path.join(DATA_DIR, "calibrations")
     data = json.loads(payload) if isinstance(payload, str) else payload
     mac = mac or data.get("device_id") or "UNKNOWN"
 

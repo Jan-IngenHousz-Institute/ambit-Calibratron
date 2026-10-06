@@ -34,29 +34,23 @@ cmd 31 and deployed devices depend on it (plan decision 7).
 from __future__ import annotations
 
 import os
-import sys
 import time
 import urllib.error
 import warnings
-
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_ROOT = os.path.dirname(_HERE)
-# This folder first, the repo root appended: the root has a different module also
-# called `helpers`, and it must never win.
-sys.path.insert(0, _HERE)
-if _ROOT not in sys.path:
-    sys.path.append(_ROOT)
 
 import helpers
 import openjii_auth             # operator sign-in + the credentials to publish
 import quality                  # LED origin fit + ADPD gate, firmware bounds mirrored
 import spec_cal                 # cmd-35 codecs, tier math, the tier-3 affine gate
 
-import firmware_fetch           # repo root: release selection policy
+import firmware_fetch           # release selection policy
+from runtime_paths import data_dir
 
 
 # ---- tunables --------------------------------------------------------------
-HERE = os.path.dirname(os.path.abspath(__file__))
+#: Writable storage: this folder from a source checkout, the per-user data
+#: directory from the packaged app (runtime_paths.data_dir).
+HERE = str(data_dir())
 CALIBRATIONS_DIR   = os.path.join(HERE, "calibrations")
 FIRMWARE_CACHE_DIR = os.path.join(HERE, "firmware_cache")
 

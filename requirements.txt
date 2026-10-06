@@ -1,28 +1,17 @@
-# Dependencies for the Calibratron tooling:
-#   - run_Calibratron.py            (+ helpers.py, mqtt_publish.py)
-#   - firmware_ambit/uploader.py
-#   - MiniParCallibration-nonAutomatic.ipynb
+# Dependencies for the Calibratron tooling: run_calibratron.py, calibratron_gui.py
+# and the modules they share (helpers.py, spec_cal.py, quality.py, openjii_auth.py).
+# The packaged GUI pins the same set in requirements-gui.txt; requirements-build.txt
+# adds the packaging toolchain.
 #
 # Install with:
 #   pip install -r requirements.txt
 
-numpy                 # data handling / curve fitting
-matplotlib            # calibration plots
 pyserial              # serial comms with the Ambit / MiniPAR / DC source
 
-paho-mqtt>=2.0        # MQTT v5 publishing, incl. the SigV4 WebSocket transport the
+paho-mqtt>=2.0        # MQTT v5 publishing over the SigV4 WebSocket transport the
                       # openJII upload uses (helpers.publish_payload_mqtt5_wss)
 certifi               # optional: portable CA roots for the openJII API calls
                       # (openjii_auth falls back to the platform trust store)
-esptool               # ESP32 firmware flashing (uploader.py); on Windows the bundled
-                      # firmware_ambit/esptool.exe is used instead, so this is optional there
-
-# Not a pip package: run_Calibratron.py downloads Ambit firmware from the
-# ambit-iot GitHub releases, which is a private repo, so the GitHub CLI must be
-# installed and logged in:
-#   https://cli.github.com  then  gh auth login
-
-# Needed only to run the .ipynb notebooks from a plain Python install;
-# skip these if you open the notebooks via the VS Code Jupyter extension.
-ipykernel
-notebook
+esptool               # ESP32 firmware flashing (helpers.flash_ambit_firmware); the
+                      # packaged app bundles it, a Windows checkout may instead drop
+                      # an esptool.exe next to helpers.py

@@ -180,7 +180,7 @@ ROLE_LABELS = {
 
 
 class CalibratronGUI:
-    def __init__(self, root: tk.Tk):
+    def __init__(self, root: tk.Tk, *, auto_sign_in=True):
         self.root = root
         root.title("Calibratron")
         root.geometry("1180x800")
@@ -193,6 +193,8 @@ class CalibratronGUI:
         self.settings = openjii_auth.Settings.load()
         #: Validated OpenJIIClient, or None while nobody is signed in.
         self.oj_client = None
+        #: Bumped per sign-in request so a stale validation can never win.
+        self._auth_generation = 0
 
         self._build_left()
         self._build_right()
@@ -201,7 +203,9 @@ class CalibratronGUI:
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         root.after(100, self._drain_queue)
         self._log_line("[gui] ready - press 'Rescan bench' to discover the instruments")
-        self._sign_in_with_stored_key()
+        # The packaged smoke test builds the window with no network access.
+        if auto_sign_in:
+            self._sign_in_with_stored_key()
 
     # ---- layout -----------------------------------------------------------
 
@@ -444,6 +448,7 @@ class CalibratronGUI:
     def _on_env_changed(self):
         self.settings.environment = self.oj_env.get()
         self.settings.save()
+        self._auth_generation += 1
         self.oj_client = None
         self.oj_user.set("not signed in")
         self._sign_in_with_stored_key()
@@ -483,8 +488,17 @@ class CalibratronGUI:
 
     def _validate_key_async(self, key, quiet=False):
         """Validate off the main thread: this is a network round trip, and it
-        happens while the operator is mounting the next device."""
+        happens while the operator is mounting the next device.
+
+        Every request carries a generation number: a validation that completes
+        after the operator switched environment or started another sign-in is
+        stale and must not overwrite the newer state (see _show_signed_in).
+        """
         env = self._env()
+        self._auth_generation += 1
+        generation = self._auth_generation
+        self.oj_client = None
+        self.oj_user.set("validating…")
 
         def work():
             client = openjii_auth.OpenJIIClient(env, key)
@@ -496,12 +510,14 @@ class CalibratronGUI:
                 else:
                     _LOG_QUEUE.put(("error", f"openJII sign-in: {exc}"))
                 return
-            _LOG_QUEUE.put(("signed_in", (client, key)))
+            _LOG_QUEUE.put(("signed_in", (generation, client, key)))
 
         threading.Thread(target=work, daemon=True).start()
 
     def _show_signed_in(self, payload):
-        client, key = payload
+        generation, client, key = payload
+        if generation != self._auth_generation or client.env.key != self.oj_env.get():
+            return                      # stale: a newer request superseded it
         self.oj_client = client
         self.settings.set_api_key(client.env.key, key)
         self.settings.environment = client.env.key
@@ -700,9 +716,23 @@ class CalibratronGUI:
                   f"{version!r} - skipping flash")
             return 0, provenance
         print(f"[flash] {decision}: {current_version!r} -> {version!r} (local folder)")
-        helpers.flash_ambit_firmware(folder, port=self.ports["ambit"])
+        port = self.ports["ambit"]
+        if not helpers.flash_ambit_firmware(folder, port=port):
+            raise RuntimeError("Local firmware flash did not complete")
         time.sleep(1.0)
         helpers.invalidate_port_cache()
+        # A local folder has no release pipeline behind it, so the only proof
+        # that the intended image is now running is the device's own banner.
+        running = helpers.ambit_reboot(port).firmware
+        try:
+            verified = firmware_fetch.compare_device_versions(running, version) == 0
+        except (TypeError, ValueError):
+            verified = False
+        if not verified:
+            raise RuntimeError(
+                f"Local firmware readback mismatch: running {running!r}, expected "
+                f"device-visible {firmware_fetch.device_visible_version(version)!r}")
+        print(f"[flash] verified device-equivalent firmware {running}")
         return 0, provenance
 
     def _run_device_worker(self):

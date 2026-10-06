@@ -454,3 +454,70 @@ What is still open is measurement, not code (plan §11): no vector here is fitte
 on ambit hardware. `AMBIT_PAR_WEIGHT_IS_AMBIT_FIT` is `false`, so bit8 stays
 clear and every device this bench produces reports provisional PAR — as it
 should, until an ambit Li-250A campaign replaces §7c.
+
+## Desktop GUI
+
+`calibratron_gui.py` is a tkinter front-end over `run_calibratron.py`: the same
+per-device pass (flash, name, tier-3 PAR, actinic LED, record, publish), with
+the bench instruments confirmed from the cached port roles for every device and
+the openJII sign-in kept for the whole session.
+
+Download the ZIP for your platform from this repository's GitHub Releases:
+
+- `calibratron-windows-x64.zip`: extract the whole folder and run `calibratron.exe`.
+- `calibratron-linux-x64.zip`: extract and run `calibratron/calibratron` (Ubuntu 22.04 or newer).
+- `calibratron-macos-arm64.zip`: extract and open `calibratron.app` (Apple Silicon).
+
+Keep the bundle's supporting files beside the executable. Python and esptool do
+not need to be installed separately; the serial drivers and the bench hardware
+are still required. The bundles are unsigned, so Windows and macOS may show an
+unknown-publisher warning. Intel macOS is not packaged.
+
+For a source checkout, install `requirements-gui.txt` (Linux also needs the
+distribution's `python3-tk`), then run `python calibratron_gui.py`. Press
+**Rescan bench**, select the steps, and press **Start calibration**.
+
+Packaged applications keep `calibrations/`, `firmware_cache/` and the
+`.port_roles.json` port hints beneath a per-user data directory
+(`runtime_paths.data_dir()`):
+
+| Platform | Data directory |
+| --- | --- |
+| Windows | `%LOCALAPPDATA%/Calibratron` |
+| macOS | `~/Library/Application Support/Calibratron` |
+| Linux | `${XDG_DATA_HOME:-~/.local/share}/Calibratron` |
+
+Set `CALIBRATRON_DATA_DIR` to override it. A source checkout uses the checkout
+folder itself. Closing the GUI deletes the downloaded firmware cache, so every
+session starts from the release that is current *now*; a locally selected
+firmware folder is never touched. API-key settings live in the separate
+per-user configuration directory managed by `openjii_auth.py`.
+
+## GUI release pipeline
+
+`.github/workflows/gui-release.yml` tests and builds Windows x64, Linux x64 and
+macOS ARM64 bundles on pull requests, pushes to `main`, and manual runs. Every
+platform runs the packaged executable's `--smoke-test`, which constructs the
+GUI without signing in, loads the bundled CA roots, and exercises the bundled
+esptool without touching a serial port. PR and manual runs leave the ZIPs as
+Actions artifacts.
+
+After all three builds pass on `main`, the same run's ZIPs and `SHA256SUMS` are
+uploaded to a draft release and then published. Tags are `calibratron-vX.Y.Z`
+and the patch number increments automatically; re-running an already published
+commit does not create another release. Publication uses the built-in
+`GITHUB_TOKEN`: no extra secret and no hand-made tag. The workflow builds the
+merged `main` commit, so merge commits, squash merges and direct pushes all
+release the same way.
+
+Local rehearsal of what CI does:
+
+```bash
+python -m pip install -r requirements-build.txt
+python -m pytest tests -q
+pyinstaller --noconfirm --clean --onedir --windowed --name calibratron \
+  --paths . --collect-all esptool packaging/launcher.py
+dist/calibratron/calibratron --smoke-test     # Linux: xvfb-run -a ...
+```
+
+Automated packaging checks do not replace a physical bench test.

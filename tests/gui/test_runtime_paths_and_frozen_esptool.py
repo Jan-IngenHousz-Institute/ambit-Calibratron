@@ -5,7 +5,6 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-import firmware_fetch
 import helpers
 import runtime_paths
 
@@ -25,11 +24,15 @@ def test_data_dir_honors_installed_app_override(monkeypatch, tmp_path):
     assert runtime_paths.data_dir() == (tmp_path / "state").resolve()
 
 
+def test_source_checkout_keeps_bench_state_next_to_the_code():
+    assert Path(helpers.DATA_DIR) == Path(helpers.HERE)
+    assert Path(helpers.PORT_ROLE_CACHE_FILE).parent == Path(helpers.DATA_DIR)
+
+
 def test_frozen_esptool_command_and_subprocess_argv_are_app_mode(monkeypatch,
                                                                 tmp_path):
     monkeypatch.setattr(helpers.sys, "frozen", True, raising=False)
     monkeypatch.setattr(helpers.sys, "executable", "/opt/calibratron/calibratron")
-    monkeypatch.setattr(firmware_fetch, "is_complete", lambda _folder: True)
     monkeypatch.setattr(helpers, "read_flash_layout", lambda _folder: [
         ("0x0", "bootloader.bin"), ("0x10000", "app.bin")])
     invoked = []
@@ -44,10 +47,11 @@ def test_frozen_esptool_command_and_subprocess_argv_are_app_mode(monkeypatch,
     monkeypatch.setattr(helpers.subprocess, "run", fake_run)
 
     assert helpers.esptool_command() == ["/opt/calibratron/calibratron", "--esptool"]
-    helpers.flash_ambit("COM7", tmp_path)
+    assert helpers.flash_ambit_firmware(tmp_path, port="COM7") is True
 
     args, cwd = invoked[0]
     assert args[:2] == ["/opt/calibratron/calibratron", "--esptool"]
     assert args[2:4] == ["--chip", "esp32c3"]
+    assert args[args.index("--port") + 1] == "COM7"
     assert args[-4:] == ["0x0", "bootloader.bin", "0x10000", "app.bin"]
     assert cwd == str(tmp_path)
