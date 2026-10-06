@@ -1,4 +1,4 @@
-﻿"""Fetch verified Ambit firmware from the public AMBIT GitHub releases.
+"""Fetch verified Ambit firmware from the public AMBIT GitHub releases.
 
 The bench used to carry a vendored copy of the firmware images in
 ``firmware_ambit/``, which meant every firmware bump needed a commit here and
