@@ -27,7 +27,7 @@ jobs:
           - os: windows-latest
             platform: windows-x64
             executable: dist/calibratron/calibratron.exe
-          - os: macos-14
+          - os: macos-15
             platform: macos-arm64
             executable: dist/calibratron.app/Contents/MacOS/calibratron
     runs-on: ${{ matrix.os }}
