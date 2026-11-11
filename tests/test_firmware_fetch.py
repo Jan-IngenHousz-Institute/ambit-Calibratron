@@ -378,6 +378,57 @@ class TestFetchLatest(_TempCache):
             calls,
         )
 
+    def _counting_http(self, handler):
+        calls = []
+
+        def counting(url):
+            calls.append(url)
+            return handler(url)
+
+        self._patch_http(counting)
+        self.addCleanup(firmware_fetch._SESSION_FIRMWARE.clear)
+        return calls
+
+    def test_session_asks_github_once_for_many_devices(self):
+        calls = self._counting_http(self._release_handler())
+        first = firmware_fetch.fetch_for_session(self.cache_root)
+        asked = len(calls)
+        self.assertGreater(asked, 0)
+        for _device in range(3):
+            self.assertEqual(first, firmware_fetch.fetch_for_session(self.cache_root))
+        self.assertEqual(asked, len(calls))
+
+    def test_session_refetches_when_the_cached_firmware_stops_verifying(self):
+        calls = self._counting_http(self._release_handler())
+        _version, path = firmware_fetch.fetch_for_session(self.cache_root)
+        asked = len(calls)
+        (path / "bootloader.bin").write_bytes(b"altered mid-session")
+        version, path = firmware_fetch.fetch_for_session(self.cache_root)
+        self.assertEqual("1.1.3-rc1", version)
+        self.assertTrue(firmware_fetch.is_complete(path))
+        self.assertGreater(len(calls), asked)
+
+    def test_session_does_not_remember_a_failed_fetch(self):
+        self._counting_http(lambda _url: (_ for _ in ()).throw(
+            urllib.error.HTTPError("https://example.invalid", 403, "rate limit", {}, None)
+        ))
+        with self.assertRaisesRegex(RuntimeError, "No usable firmware"):
+            firmware_fetch.fetch_for_session(self.cache_root)
+        calls = self._counting_http(self._release_handler())
+        version, _path = firmware_fetch.fetch_for_session(self.cache_root)
+        self.assertEqual("1.1.3-rc1", version)
+        self.assertGreater(len(calls), 0)
+
+    def test_cache_from_last_session_covers_a_rate_limited_github(self):
+        self._counting_http(self._release_handler())
+        expected = firmware_fetch.fetch_for_session(self.cache_root)
+        firmware_fetch._SESSION_FIRMWARE.clear()          # the GUI was closed
+
+        self._counting_http(lambda _url: (_ for _ in ()).throw(
+            urllib.error.HTTPError("https://example.invalid", 403, "rate limit", {}, None)
+        ))
+        self.assertEqual(expected, firmware_fetch.fetch_for_session(self.cache_root))
+
     def test_token_is_sent_only_to_api_host_not_public_assets(self):
         asset_url = firmware_fetch._canonical_asset_url(
             "v1.1.3-rc1", "manifest.json"

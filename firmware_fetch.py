@@ -31,6 +31,9 @@ Design notes (all of these are field-bench requirements):
     back to the newest complete cache entry.
     The caller still compares its numeric device-visible version and never
     flashes an equal or older target in the normal flow.
+  - GitHub is asked once per session, not once per device
+    (``fetch_for_session``), and the cache is kept between sessions so the
+    next one still has a proven firmware when GitHub refuses to answer.
   - any missing/malformed digest, size disagreement, unsafe path, wrong chip,
     mutable release, or corrupt byte is rejected. A corrupt image can otherwise
     brick the device until it is reflashed over the CH343 bridge by hand.
@@ -764,6 +767,46 @@ def fetch_latest(cache_root):
             FIRMWARE_REPO, reason, version, version_dir,
         )
         return version, version_dir
+
+
+# What fetch_for_session() resolved, keyed by cache folder, for this process.
+_SESSION_FIRMWARE = {}
+
+
+def fetch_for_session(cache_root):
+    """Resolve the firmware once per process and reuse it for every device.
+
+    A bench session calibrates many devices and the release does not change
+    between two of them. Asking GitHub again for each one costs two anonymous
+    API calls per device against a 60/hour budget that is shared by every
+    machine behind the same public IP, and that budget running out left a
+    device on its as-received firmware. So the first device of a session
+    pays for :func:`fetch_latest` (online, or the cached copy if GitHub will
+    not answer) and the rest reuse that answer without touching the network.
+
+    The remembered entry is re-verified on every reuse, so a cache folder
+    that was deleted or altered mid-session is fetched again rather than
+    trusted. A failed fetch is not remembered: the next device retries.
+
+    :param cache_root: the ``firmware_cache`` folder (created on demand)
+    :return: (version, Path), as :func:`fetch_latest`
+    :raises RuntimeError: as :func:`fetch_latest`
+    """
+    key = str(Path(cache_root).resolve())
+    remembered = _SESSION_FIRMWARE.get(key)
+    if remembered is not None:
+        version, version_dir = remembered
+        if is_complete(version_dir):
+            logger.info("reusing firmware %s fetched earlier this session (%s)",
+                        version, version_dir)
+            return remembered
+        logger.warning("firmware %s in %s no longer verifies - fetching it again",
+                       version, version_dir)
+        del _SESSION_FIRMWARE[key]
+
+    resolved = fetch_latest(cache_root)
+    _SESSION_FIRMWARE[key] = resolved
+    return resolved
 
 
 def _describe_url_error(exc):
