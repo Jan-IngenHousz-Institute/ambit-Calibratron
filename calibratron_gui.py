@@ -31,17 +31,17 @@ The ADPD dark baseline step is not offered: it needs a fixture change mid-run
 (see the run_calibratron module docstring) and calibrates nothing on the PAR
 chain. Run it from the CLI when it is needed.
 
-On close the downloaded firmware cache (run_calibratron.FIRMWARE_CACHE_DIR)
-is deleted - releases are re-proven and re-downloaded next session, so the
-bench never trusts a stale cache. A user-selected local firmware folder is
-never touched.
+The GitHub release is resolved once per session: the first device asks GitHub
+and every later device reuses that answer (firmware_fetch.fetch_for_session).
+The downloaded cache (run_calibratron.FIRMWARE_CACHE_DIR) is kept on close, so
+the next session re-proves the release online and still has a verified
+firmware to fall back on when GitHub refuses to answer.
 """
 
 from __future__ import annotations
 
 import os
 import queue
-import shutil
 import sys
 import threading
 import time
@@ -958,12 +958,6 @@ class CalibratronGUI:
                     "Calibratron", "A calibration is still running. Close anyway?\n"
                                    "(The lamp/LED may be left driven.)"):
                 return
-        cache = rc.FIRMWARE_CACHE_DIR
-        # Only ever the runner's own download cache - never a user-selected
-        # local firmware folder.
-        if os.path.basename(cache) == "firmware_cache" and os.path.isdir(cache):
-            shutil.rmtree(cache, ignore_errors=True)
-            print(f"[gui] deleted the firmware cache: {cache}")
         self.root.destroy()
 
 

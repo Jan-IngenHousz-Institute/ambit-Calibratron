@@ -188,7 +188,7 @@ def flash_firmware(port, *, force=False, current_version=None,
     :return: ``(rc, provenance)`` - rc 0 on success or a deliberate skip
     """
     try:
-        version, firmware_dir = firmware_fetch.fetch_latest(FIRMWARE_CACHE_DIR)
+        version, firmware_dir = firmware_fetch.fetch_for_session(FIRMWARE_CACHE_DIR)
         provenance = firmware_fetch.release_provenance(firmware_dir)
     except (urllib.error.URLError, RuntimeError, OSError) as exc:
         print(f"[flash] could not obtain the Ambit firmware: {exc}")

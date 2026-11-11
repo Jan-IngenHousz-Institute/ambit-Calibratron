@@ -488,10 +488,13 @@ Packaged applications keep `calibrations/`, `firmware_cache/` and the
 | Linux | `${XDG_DATA_HOME:-~/.local/share}/Calibratron` |
 
 Set `CALIBRATRON_DATA_DIR` to override it. A source checkout uses the checkout
-folder itself. Closing the GUI deletes the downloaded firmware cache, so every
-session starts from the release that is current *now*; a locally selected
-firmware folder is never touched. API-key settings live in the separate
-per-user configuration directory managed by `openjii_auth.py`.
+folder itself. The firmware release is resolved once per session: the first
+device asks GitHub, every later device reuses that answer. The downloaded
+firmware cache is kept when the GUI closes, so the next session re-proves the
+release online and falls back to the cached copy if GitHub will not answer
+(anonymous API calls are limited to 60 per hour per public IP). API-key
+settings live in the separate per-user configuration directory managed by
+`openjii_auth.py`.
 
 ## GUI release pipeline
 
